@@ -1,0 +1,7 @@
+{
+  "jobId": "job-failed",
+  "status": "failed",
+  "frames": [],
+  "guide": null,
+  "error": {"code": "PROCESSING_FAILED", "message": "The video could not be processed."}
+}

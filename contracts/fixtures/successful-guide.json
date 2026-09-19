@@ -1,0 +1,16 @@
+{
+  "jobId": "job-ready",
+  "status": "ready",
+  "frames": [
+    {"frameId": "frame-0001", "timestampSeconds": 0, "imageUrl": "/jobs/job-ready/frames/frame-0001"},
+    {"frameId": "frame-0002", "timestampSeconds": 1, "imageUrl": "/jobs/job-ready/frames/frame-0002"}
+  ],
+  "guide": {
+    "title": "Small brick model",
+    "steps": [
+      {"text": "Place the red brick on the base.", "frameId": "frame-0001", "uncertainty": null},
+      {"text": "Add the blue brick on the right side.", "frameId": "frame-0002", "uncertainty": "The hand obscures the final alignment."}
+    ]
+  },
+  "error": null
+}

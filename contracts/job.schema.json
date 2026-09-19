@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rebuilt.local/contracts/job.schema.json",
+  "title": "Job",
+  "type": "object",
+  "required": ["jobId", "status", "frames", "guide", "error"],
+  "properties": {
+    "jobId": {"type": "string", "minLength": 1},
+    "status": {"enum": ["queued", "extracting", "generating", "ready", "failed"]},
+    "frames": {"type": "array", "items": {"$ref": "#/$defs/frame"}},
+    "guide": {"anyOf": [{"$ref": "#/$defs/guide"}, {"type": "null"}]},
+    "error": {"anyOf": [{"$ref": "#/$defs/error"}, {"type": "null"}]}
+  },
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "required": ["frameId", "timestampSeconds", "imageUrl"],
+      "properties": {
+        "frameId": {"type": "string", "minLength": 1},
+        "timestampSeconds": {"type": "number", "minimum": 0},
+        "imageUrl": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "required": ["text", "frameId", "uncertainty"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1},
+        "frameId": {"type": "string", "minLength": 1},
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "guide": {
+      "type": "object",
+      "required": ["title", "steps"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}, "minItems": 1}
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "message": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  }
+}
