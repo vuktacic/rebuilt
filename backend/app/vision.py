@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
 import json
+import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,9 @@ from typing import Any, Protocol
 from .config import Settings
 from .errors import AppError
 from .models import AnalysisEvent, AnalysisInfo, TrackSummary
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -447,6 +451,12 @@ class Sam3VisionAnalyzer:
                 raise AppError(504, "ANALYSIS_TIMEOUT", "Local vision analysis exceeded its time limit.") from exc
             if completed.returncode == 0:
                 break
+            LOGGER.error(
+                "SAM3 worker attempt %d failed with return code %d. stderr tail:\n%s",
+                attempt + 1,
+                completed.returncode,
+                completed.stderr[-12000:],
+            )
             detail = completed.stderr.lower()
             if "out of memory" in detail or "cuda oom" in detail:
                 raise AppError(503, "VISION_OOM", "SAM3 ran out of GPU memory during local analysis.")
@@ -478,7 +488,7 @@ class Sam3VisionAnalyzer:
     def _analyze_loaded(self, frame_dir: Path, frame_count: int, job_id: str) -> AnalysisResult:
         started = time.monotonic()
         predictor = self._load_predictor()
-        frame_paths = sorted(frame_dir.glob("frame-*.jpg"))
+        frame_paths = sorted(path.resolve() for path in frame_dir.glob("frame-*.jpg"))
         window_size = max(1, int(round(self.settings.analysis_window_seconds * self.settings.analysis_fps)))
         overlap = max(0, min(window_size - 1, int(round(self.settings.analysis_overlap_seconds * self.settings.analysis_fps))))
         step = max(1, window_size - overlap)

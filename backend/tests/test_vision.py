@@ -251,6 +251,28 @@ def test_worker_retries_transient_exit_within_processing_timeout(tmp_path: Path,
     assert attempts[1] < attempts[0]
 
 
+def test_analysis_windows_resolve_relative_frame_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    frame_dir = Path("relative-frames")
+    frame_dir.mkdir()
+    source = frame_dir / "frame-0000.jpg"
+    source.write_bytes(b"fake-jpeg")
+    analyzer = Sam3VisionAnalyzer(Settings(data_dir=Path("relative-data"), vision_worker=False))
+    monkeypatch.setattr(analyzer, "_load_predictor", lambda: object())
+
+    def inspect_window(predictor: object, window_dir: Path, frame_count: int, frame_offset: int) -> list[Detection]:
+        linked_frame = window_dir / "000000.jpg"
+        assert linked_frame.is_file()
+        assert linked_frame.resolve() == source.resolve()
+        return []
+
+    monkeypatch.setattr(analyzer, "_run_session", inspect_window)
+
+    result = analyzer._analyze_loaded(frame_dir, frame_count=1, job_id="relative-path")
+
+    assert result.analysis.metrics["frames"] == 1.0
+
+
 def test_piece_contact_can_form_cluster_without_assembly_prompt(tmp_path: Path) -> None:
     detections = []
     for frame_index in range(12):
