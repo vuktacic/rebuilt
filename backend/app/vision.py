@@ -70,6 +70,11 @@ class VisionUnavailable(AppError):
         super().__init__(503, "VISION_UNAVAILABLE", message)
 
 
+class VisionWeightsMissing(AppError):
+    def __init__(self, message: str = "The configured SAM3 checkpoint is unavailable."):
+        super().__init__(503, "VISION_WEIGHTS_MISSING", message)
+
+
 def _iou(left: Detection, right: Detection) -> float:
     lx, ly, lw, lh = left.bbox
     rx, ry, rw, rh = right.bbox
@@ -438,8 +443,9 @@ class Sam3VisionAnalyzer:
             detail = completed.stderr.lower()
             if "out of memory" in detail or "cuda oom" in detail:
                 raise AppError(503, "VISION_OOM", "SAM3 ran out of GPU memory during local analysis.")
-            if "no such file" in detail or "checkpoint" in detail and "not found" in detail:
-                raise AppError(503, "VISION_WEIGHTS_MISSING", "The configured SAM3 checkpoint is unavailable.")
+            checkpoint = self.settings.sam3_checkpoint
+            if checkpoint is not None and not checkpoint.is_file():
+                raise VisionWeightsMissing()
             raise VisionUnavailable("The local SAM3 worker could not complete analysis.")
         try:
             payload = json.loads(completed.stdout)
@@ -587,6 +593,8 @@ class Sam3VisionAnalyzer:
                     pass
 
     def _load_predictor(self) -> Any:
+        if self.settings.sam3_checkpoint is not None and not self.settings.sam3_checkpoint.is_file():
+            raise VisionWeightsMissing(f"The configured SAM3 checkpoint does not exist: {self.settings.sam3_checkpoint}")
         token_path = self.settings.sam3_hf_token_path
         token_loaded = bool(os.getenv("HF_TOKEN"))
         if token_path and token_path.is_file():

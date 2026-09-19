@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from backend.app.config import Settings
 from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, TrackSummary
 from backend.app.processing import ExtractedFrames, JobProcessor
@@ -13,6 +15,7 @@ from backend.app.vision import (
     PersistentTrackAssociator,
     Sam3VisionAnalyzer,
     WindowTrackStitcher,
+    VisionWeightsMissing,
 )
 
 
@@ -208,6 +211,17 @@ def test_sam3_runs_each_concept_in_an_independent_session(tmp_path: Path) -> Non
     ]
     assert predictor.masks == [("session-3", 1), ("session-3", 2)]
     assert [detection.concept for detection in detections] == ["LEGO piece", "hand"]
+
+
+def test_missing_explicit_checkpoint_is_reported_as_weights_error(tmp_path: Path) -> None:
+    analyzer = Sam3VisionAnalyzer(Settings(
+        data_dir=tmp_path,
+        sam3_checkpoint=tmp_path / "missing.pt",
+        vision_worker=False,
+    ))
+
+    with pytest.raises(VisionWeightsMissing, match="does not exist"):
+        analyzer._load_predictor()
 
 
 def test_piece_contact_can_form_cluster_without_assembly_prompt(tmp_path: Path) -> None:
