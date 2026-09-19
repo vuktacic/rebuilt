@@ -137,14 +137,20 @@ class Sam2BackwardVisionAnalyzer:
                 observations[object_id].get(frame_index, TrackObservation(frameIndex=frame_index, visible=False))
                 for frame_index in range(frame_count)
             ]
-            attachment_start, attachment_end = self._attachment_range(chronological)
             tracks.append(PartTrack(
                 partId=object_id,
                 name=name,
                 observations=chronological,
-                attachmentStartFrame=attachment_start,
-                attachmentEndFrame=attachment_end,
+                attachmentStartFrame=None,
+                attachmentEndFrame=None,
             ))
+        for track in tracks:
+            separate_frame, attached_frame = self._attachment_range(
+                track.observations,
+                [other.observations for other in tracks if other.partId != track.partId],
+            )
+            track.attachmentStartFrame = separate_frame
+            track.attachmentEndFrame = attached_frame
         events = self._events_from_part_tracks(tracks)
         elapsed = time.monotonic() - started
         summaries = [
@@ -221,11 +227,43 @@ class Sam2BackwardVisionAnalyzer:
             return TrackObservation(frameIndex=frame_index, visible=False)
 
     @staticmethod
-    def _attachment_range(observations: list[TrackObservation]) -> tuple[int | None, int | None]:
-        visible = [item.frameIndex for item in observations if item.visible]
-        if not visible or visible[0] == 0:
-            return None, None
-        return visible[0] - 1, visible[0]
+    def _attachment_range(
+        observations: list[TrackObservation],
+        other_tracks: list[list[TrackObservation]],
+    ) -> tuple[int | None, int | None]:
+        """Find an assembly-direction transition from side-by-side to joined.
+
+        Source frames are disassembly-order (attached → separate), so a durable
+        high-overlap-to-low-overlap transition is inverted for the guide.
+        """
+        def overlap(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
+            lx, ly, lw, lh = left
+            rx, ry, rw, rh = right
+            intersection = max(0.0, min(lx + lw, rx + rw) - max(lx, rx)) * max(0.0, min(ly + lh, ry + rh) - max(ly, ry))
+            return intersection / max(1.0, min(lw * lh, rw * rh))
+
+        scores: list[float] = []
+        for frame, observation in enumerate(observations):
+            if not observation.visible or observation.bbox is None:
+                scores.append(0.0)
+                continue
+            candidates: list[float] = []
+            for candidate in other_tracks:
+                if frame >= len(candidate) or not candidate[frame].visible:
+                    continue
+                candidate_bbox = candidate[frame].bbox
+                if candidate_bbox is not None:
+                    candidates.append(overlap(observation.bbox, candidate_bbox))
+            scores.append(max(candidates, default=0.0))
+        # Broad threshold: retain transitions where the part substantially joins
+        # another mask, then require a stable isolated state after disassembly.
+        for attached in range(0, max(0, len(scores) - 4)):
+            if min(scores[attached:attached + 3]) < 0.30:
+                continue
+            if max(scores[attached + 3:attached + 5]) > 0.12:
+                continue
+            return attached + 3, attached + 2
+        return None, None
 
     def _events_from_part_tracks(self, tracks: list[PartTrack]) -> list[AnalysisEvent]:
         events: list[AnalysisEvent] = []
@@ -235,16 +273,17 @@ class Sam2BackwardVisionAnalyzer:
             events.append(AnalysisEvent(
                 eventId=f"event-{len(events) + 1:04d}",
                 kind="uncertain_change",
-                startTimestampSeconds=track.attachmentStartFrame / self.settings.analysis_fps,
-                endTimestampSeconds=track.attachmentEndFrame / self.settings.analysis_fps,
+                # Reassembly is the inverse of source/disassembly chronology.
+                startTimestampSeconds=(track.observations[-1].frameIndex - track.attachmentStartFrame) / self.settings.analysis_fps,
+                endTimestampSeconds=(track.observations[-1].frameIndex - track.attachmentEndFrame) / self.settings.analysis_fps,
                 affectedTrackIds=[f"part:{track.partId}"],
                 beforeFrameId=f"frame-{track.attachmentStartFrame:04d}",
                 afterFrameId=f"frame-{track.attachmentEndFrame:04d}",
-                evidenceStrength=0.55,
-                uncertainty="The attachment interval was inferred from reverse-track visibility; review the overlay before using this step.",
-                evidence=f"{track.name} transitions from isolated to occluded or attached.",
+                evidenceStrength=0.72,
+                uncertainty=None,
+                evidence=f"{track.name} moves from the side into sustained substantial overlap with another tracked part.",
             ))
-        return events
+        return sorted(events, key=lambda event: event.startTimestampSeconds)
 
 
 class VisionUnavailable(AppError):

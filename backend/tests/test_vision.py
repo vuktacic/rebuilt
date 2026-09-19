@@ -8,7 +8,7 @@ import pytest
 
 import backend.app.vision as vision_module
 from backend.app.config import Settings
-from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, TrackSummary
+from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, PartTrack, TrackObservation, TrackSummary
 from backend.app.processing import ExtractedFrames, JobProcessor
 from backend.app.storage import JobRepository
 from backend.app.vision import (
@@ -17,11 +17,38 @@ from backend.app.vision import (
     EventDetector,
     MlxSam3VisionAnalyzer,
     PersistentTrackAssociator,
+    Sam2BackwardVisionAnalyzer,
     Sam3VisionAnalyzer,
     StableStateChangeDetector,
     WindowTrackStitcher,
     VisionWeightsMissing,
 )
+
+
+def test_sam2_attachment_requires_sustained_overlap_and_reverses_event_order() -> None:
+    def observation(frame: int, bbox: tuple[float, float, float, float]) -> TrackObservation:
+        return TrackObservation(frameIndex=frame, bbox=bbox, centroid=(bbox[0], bbox[1]), visible=True)
+
+    moving = [observation(frame, (0, 0, 10, 10) if frame < 3 else (30, 0, 10, 10)) for frame in range(7)]
+    anchor = [observation(frame, (0, 0, 10, 10)) for frame in range(7)]
+    separate, attached = Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor])
+
+    assert (separate, attached) == (3, 2)
+    analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=Path(".data-test"), analysis_fps=2))
+    events = analyzer._events_from_part_tracks([
+        PartTrack(partId=1, name="side panel", observations=moving, attachmentStartFrame=separate, attachmentEndFrame=attached),
+    ])
+    assert [(event.beforeFrameId, event.afterFrameId) for event in events] == [("frame-0003", "frame-0002")]
+    assert events[0].startTimestampSeconds < events[0].endTimestampSeconds
+
+
+def test_sam2_attachment_rejects_transient_overlap() -> None:
+    def observation(frame: int, bbox: tuple[float, float, float, float]) -> TrackObservation:
+        return TrackObservation(frameIndex=frame, bbox=bbox, centroid=(bbox[0], bbox[1]), visible=True)
+
+    moving = [observation(frame, (0, 0, 10, 10) if frame == 1 else (30, 0, 10, 10)) for frame in range(7)]
+    anchor = [observation(frame, (0, 0, 10, 10)) for frame in range(7)]
+    assert Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor]) == (None, None)
 
 
 def detection_series(*, hand_occluded: bool = False) -> list[Detection]:
