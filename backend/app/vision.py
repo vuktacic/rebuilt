@@ -427,26 +427,36 @@ class Sam3VisionAnalyzer:
         environment["REBUILT_VISION_WORKER"] = "0"
         environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         request = json.dumps({"frame_dir": str(frame_dir), "frame_count": frame_count, "job_id": job_id})
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "backend.app.vision_worker"],
-                input=request,
-                capture_output=True,
-                text=True,
-                env=environment,
-                timeout=self.settings.processing_timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise AppError(504, "ANALYSIS_TIMEOUT", "Local vision analysis exceeded its time limit.") from exc
-        if completed.returncode != 0:
+        deadline = time.monotonic() + self.settings.processing_timeout_seconds
+        completed = None
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AppError(504, "ANALYSIS_TIMEOUT", "Local vision analysis exceeded its time limit.")
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-m", "backend.app.vision_worker"],
+                    input=request,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    timeout=remaining,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise AppError(504, "ANALYSIS_TIMEOUT", "Local vision analysis exceeded its time limit.") from exc
+            if completed.returncode == 0:
+                break
             detail = completed.stderr.lower()
             if "out of memory" in detail or "cuda oom" in detail:
                 raise AppError(503, "VISION_OOM", "SAM3 ran out of GPU memory during local analysis.")
             checkpoint = self.settings.sam3_checkpoint
             if checkpoint is not None and not checkpoint.is_file():
                 raise VisionWeightsMissing()
-            raise VisionUnavailable("The local SAM3 worker could not complete analysis.")
+            if attempt == 0:
+                continue
+            raise VisionUnavailable(self._worker_failure_message(completed))
+        assert completed is not None
         try:
             payload = json.loads(completed.stdout)
             return AnalysisResult(
@@ -456,6 +466,14 @@ class Sam3VisionAnalyzer:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise VisionUnavailable("The local SAM3 worker returned invalid analysis data.") from exc
+
+    @staticmethod
+    def _worker_failure_message(completed: subprocess.CompletedProcess[str]) -> str:
+        if completed.returncode < 0:
+            detail = f"signal {-completed.returncode}"
+        else:
+            detail = f"exit code {completed.returncode}"
+        return f"The local SAM3 worker could not complete analysis ({detail})."
 
     def _analyze_loaded(self, frame_dir: Path, frame_count: int, job_id: str) -> AnalysisResult:
         started = time.monotonic()

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import backend.app.vision as vision_module
 from backend.app.config import Settings
 from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, TrackSummary
 from backend.app.processing import ExtractedFrames, JobProcessor
@@ -222,6 +225,30 @@ def test_missing_explicit_checkpoint_is_reported_as_weights_error(tmp_path: Path
 
     with pytest.raises(VisionWeightsMissing, match="does not exist"):
         analyzer._load_predictor()
+
+
+def test_worker_retries_transient_exit_within_processing_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts: list[float] = []
+    payload = {
+        "events": [],
+        "tracks": [],
+        "analysis": {"backend": "test", "modelVersion": "test", "configVersion": "test"},
+    }
+
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        attempts.append(float(kwargs["timeout"]))
+        if len(attempts) == 1:
+            return SimpleNamespace(returncode=1, stderr="transient worker failure", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(payload))
+
+    monkeypatch.setattr(vision_module.subprocess, "run", fake_run)
+    analyzer = Sam3VisionAnalyzer(Settings(data_dir=tmp_path, processing_timeout_seconds=10))
+
+    result = analyzer._analyze_worker(tmp_path, frame_count=0, job_id="retry")
+
+    assert result.analysis.backend == "test"
+    assert len(attempts) == 2
+    assert attempts[1] < attempts[0]
 
 
 def test_piece_contact_can_form_cluster_without_assembly_prompt(tmp_path: Path) -> None:
