@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Turn a LEGO build recording into editable illustrated instructions." />
+    <title>Rebuilt — video to instructions</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="wordmark" href="/" aria-label="Rebuilt home">
+          <span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>rebuilt</span>
+        </a>
+        <div class="header-meta">
+          <span class="local-indicator"><i></i> Local vision</span>
+          <span class="header-rule"></span>
+          <span>Private by design</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-copy">
+          <p class="eyebrow"><span></span> Video to assembly guide</p>
+          <h1 id="page-title">Turn the build<br />back into <em>steps.</em></h1>
+          <p class="lede">Rebuilt follows each piece through your recording, finds the moments that matter, and turns them into an editable visual guide.</p>
+          <div class="hero-details" aria-label="Product capabilities">
+            <span>Runs locally</span><i></i><span>Tracks occlusion</span><i></i><span>Editable output</span>
+          </div>
+        </div>
+
+        <div class="vision-preview" aria-hidden="true">
+          <div class="preview-topline"><span>LOCAL ANALYSIS</span><span class="preview-live"><i></i> READY</span></div>
+          <div class="preview-stage">
+            <div class="scan-line"></div>
+            <div class="brick brick-blue"><i></i><i></i><i></i><i></i></div>
+            <div class="brick brick-gold"><i></i><i></i><i></i></div>
+            <div class="tracking-box box-one"><span>piece 01</span></div>
+            <div class="tracking-box box-two"><span>piece 02</span></div>
+          </div>
+          <div class="preview-footer">
+            <span><b>01</b> segment</span><span><b>02</b> track</span><span><b>03</b> explain</span>
+          </div>
+        </div>
+      </section>
+
+      <div id="mode-banner" class="mode-banner" hidden></div>
+
+      <section class="workflow" aria-label="Build guide workflow">
+        <div class="workflow-label"><span>New analysis</span><span class="workflow-line"></span><span>01—02</span></div>
+        <div class="workspace">
+          <section class="upload-panel workflow-stage" aria-labelledby="upload-heading">
+            <div class="stage-heading">
+              <span class="stage-number">01</span>
+              <div><p class="stage-kicker">Source</p><h2 id="upload-heading">Add your recording</h2></div>
+            </div>
+            <p class="panel-copy">Use a short, fixed-camera video. A clear pause between movements gives the tracker stronger evidence.</p>
+            <form id="upload-form">
+              <label id="drop-zone" class="drop-zone" for="video-input">
+                <input id="video-input" type="file" name="video" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv" />
+                <span class="drop-symbol" aria-hidden="true"><span>＋</span></span>
+                <span class="drop-copy"><b>Drop a video here</b><small>or choose from your device · up to 250 MB</small></span>
+                <span id="selected-file" class="selected-file" hidden></span>
+              </label>
+              <button id="upload-button" class="button button-primary" type="submit" disabled>Begin analysis <span aria-hidden="true">↗</span></button>
+            </form>
+          </section>
+
+          <section class="status-panel workflow-stage" aria-labelledby="status-heading" aria-live="polite">
+            <div class="stage-heading">
+              <span class="stage-number">02</span>
+              <div><p class="stage-kicker">Process</p><h2 id="status-heading">Analysis status</h2></div>
+              <span id="status-pill" class="status-pill">Waiting</span>
+            </div>
+            <div class="status-body">
+              <div class="status-orbit" aria-hidden="true"><span></span><i></i></div>
+              <div><p id="status-message" class="status-message">Choose a recording to begin</p><p id="status-detail" class="status-detail">Your model and source footage stay on this machine.</p></div>
+            </div>
+            <div class="progress-track" aria-hidden="true"><span id="progress-bar"></span></div>
+            <div class="progress-labels" aria-hidden="true"><span>Extract</span><span>Track</span><span>Describe</span></div>
+            <div id="error-box" class="error-box" role="alert" hidden></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="timeline-panel" class="result-section timeline-panel" aria-labelledby="timeline-heading" hidden>
+        <div class="section-heading">
+          <div class="section-index"><span>03</span></div>
+          <div class="section-title"><p class="stage-kicker">Vision evidence</p><h2 id="timeline-heading">Moments that changed the build</h2><p class="panel-copy">Before and after frames stay linked to each detected change, including anything the model could not see clearly.</p></div>
+          <span id="timeline-count" class="count-badge"></span>
+        </div>
+        <div id="events-list" class="events-list"></div>
+      </section>
+
+      <section id="guide-panel" class="result-section guide-panel" aria-labelledby="guide-heading" hidden>
+        <div class="section-heading guide-heading-row">
+          <div class="section-index"><span>04</span></div>
+          <div class="section-title"><p class="stage-kicker">Final output</p><h2 id="guide-heading">Your reassembly guide</h2><p class="panel-copy">Refine the instructions and choose the clearest reference frame before saving.</p></div>
+          <div class="guide-actions"><span id="dirty-label" class="dirty-label" hidden>Unsaved</span><button id="save-button" class="button button-primary" type="button">Save guide <span aria-hidden="true">✓</span></button></div>
+        </div>
+        <div id="save-error" class="error-box" role="alert" hidden></div>
+        <label class="title-field" for="guide-title"><span>Guide title</span><input id="guide-title" data-field="title" type="text" autocomplete="off" /></label>
+        <div id="steps-list" class="steps-list"></div>
+        <button id="add-step-button" class="button button-secondary add-step" type="button"><span aria-hidden="true">＋</span> Add another step</button>
+      </section>
+
+      <div class="footer-actions"><button id="reset-button" class="text-button" type="button"><span>↺</span> Start another build</button></div>
+    </main>
+
+    <footer class="site-footer"><span>Rebuilt / local assembly intelligence</span><span>Review every generated guide before rebuilding.</span></footer>
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>
