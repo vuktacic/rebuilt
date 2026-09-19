@@ -26,6 +26,9 @@ Describe only visible assembly changes, use a clear completed-state frame for ea
 and mention uncertainty when a hand or occlusion hides placement. Local analysis labels each pair BEFORE
 and AFTER; describe additions for attach events and removals for detach events. Return exactly one
 step per supplied event, in event order, without merging separate events.
+Write every title and step in clear, neutral Standard Technical English. Use precise imperative verbs,
+consistent part references, and short unambiguous sentences; avoid slang, idioms, conversational filler,
+or region-specific phrasing.
 Every frameId must be copied exactly from the supplied frame list. Do not invent pieces or frame IDs.
 """
 
