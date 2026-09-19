@@ -10,6 +10,9 @@ export function initialState(mode = "live") {
     status: null,
     frames: [],
     tracks: [],
+    annotations: [],
+    partTracks: [],
+    trackingProgress: null,
     events: [],
     analysis: null,
     guide: null,
@@ -43,6 +46,9 @@ export function reduce(state, action) {
         status: job.status,
         frames: copy(job.frames || []),
         tracks: copy(job.tracks || []),
+        annotations: copy(job.annotations || []),
+        partTracks: copy(job.partTracks || []),
+        trackingProgress: job.trackingProgress ?? null,
         events: copy(job.events || []),
         analysis: job.analysis ? copy(job.analysis) : null,
         guide: readyGuide,
@@ -61,6 +67,9 @@ export function reduce(state, action) {
         status: job.status,
         frames: copy(job.frames || []),
         tracks: copy(job.tracks || []),
+        annotations: copy(job.annotations || []),
+        partTracks: copy(job.partTracks || []),
+        trackingProgress: job.trackingProgress ?? null,
         events: copy(job.events || []),
         analysis: job.analysis ? copy(job.analysis) : null,
         guide: job.guide ? copy(job.guide) : null,
@@ -118,7 +127,8 @@ export function statusMessage(state) {
   if (state.phase === "uploading") return "Uploading your recording…";
   if (state.status === "queued") return "Waiting to start…";
   if (state.status === "extracting") return "Selecting useful frames…";
-  if (state.status === "analyzing") return "Tracking pieces and detecting changes…";
+  if (state.status === "annotating") return "Name visible parts on the final frame…";
+  if (state.status === "analyzing") return "Tracking named parts backward through the video…";
   if (state.status === "generating") return "Writing the assembly guide…";
   if (state.phase === "ready") return state.dirty ? "Unsaved edits" : "Guide ready to review";
   if (state.phase === "error") return "Something needs attention";

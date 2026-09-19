@@ -56,8 +56,10 @@ test("status messages distinguish processing and unsaved review", () => {
   let state = reduce(initialState(), { type: "UPLOAD_STARTED", name: "build.mp4" });
   assert.equal(statusMessage(state), "Uploading your recording…");
   state = reduce(state, { type: "UPLOAD_ACCEPTED", jobId: "job-1" });
+  state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "annotating", frames, events: [], guide: null, error: null } });
+  assert.equal(statusMessage(state), "Name visible parts on the final frame…");
   state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "analyzing", frames, events: [{ eventId: "event-1" }], guide: null, error: null } });
-  assert.equal(statusMessage(state), "Tracking pieces and detecting changes…");
+  assert.equal(statusMessage(state), "Tracking named parts backward through the video…");
   assert.equal(state.events.length, 1);
   state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "generating", frames, guide: null, error: null } });
   assert.equal(statusMessage(state), "Writing the assembly guide…");

@@ -7,9 +7,12 @@ __pycache__/
 
 private
 .venv-sam3/
+.venv-arm64/
+.venv-mlx-sam3/
 .models/
 .third_party/
 .artifacts/
+reports/
 .env
 .env.*
 !.env.example

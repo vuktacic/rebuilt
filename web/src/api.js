@@ -65,12 +65,24 @@ function liveClient(fetchImpl) {
       });
     },
 
+    saveAnnotations(jobId, annotations) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/annotations`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ annotations }),
+      });
+    },
+
+    trackBackward(jobId) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/track`, { method: "POST" });
+    },
+
     async pollJob(jobId, { onUpdate, signal, intervalMs = 2000 } = {}) {
       while (true) {
         if (signal?.aborted) throw new ApiError("Polling was cancelled.", { code: "ABORTED" });
         const job = await this.getJob(jobId);
         onUpdate?.(job);
-        if (job.status === "ready" || job.status === "failed") return job;
+        if (job.status === "annotating" || job.status === "ready" || job.status === "failed") return job;
         await wait(intervalMs, signal);
       }
     },
@@ -194,7 +206,7 @@ function mockClient(options = {}) {
         if (signal?.aborted) throw new ApiError("Polling was cancelled.", { code: "ABORTED" });
         const job = await getJob(jobId);
         onUpdate?.(job);
-        if (job.status === "ready" || job.status === "failed") return job;
+        if (job.status === "annotating" || job.status === "ready" || job.status === "failed") return job;
         await wait(intervalMs, signal);
       }
     },

@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobResponse, JobStatus, TrackSummary
+from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobResponse, JobStatus, PartAnnotation, PartTrack, TrackSummary
 
 
 ACTIVE_STATUSES = {"queued", "extracting", "analyzing", "generating"}
@@ -54,6 +54,9 @@ class JobRepository:
         status: JobStatus | None = None,
         frames: list[Frame] | None = None,
         tracks: list[TrackSummary] | None = None,
+        annotations: list[PartAnnotation] | None = None,
+        part_tracks: list[PartTrack] | None = None,
+        tracking_progress: float | None = None,
         events: list[AnalysisEvent] | None = None,
         analysis: AnalysisInfo | None = None,
         guide: Guide | None = None,
@@ -67,6 +70,9 @@ class JobRepository:
                 "status": status if status is not None else current.status,
                 "frames": frames if frames is not None else current.frames,
                 "tracks": tracks if tracks is not None else current.tracks,
+                "annotations": annotations if annotations is not None else current.annotations,
+                "partTracks": part_tracks if part_tracks is not None else current.partTracks,
+                "trackingProgress": tracking_progress if tracking_progress is not None else current.trackingProgress,
                 "events": events if events is not None else current.events,
                 "analysis": analysis if analysis is not None else current.analysis,
                 "guide": guide if guide is not None else current.guide,

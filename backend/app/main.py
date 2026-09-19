@@ -11,12 +11,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .config import Settings
+from .config import Settings, VisionRuntimeError
 from .errors import AppError, error_payload
-from .models import Guide, JobCreated, JobResponse
+from .models import AnnotationRequest, Guide, JobCreated, JobResponse
 from .processing import JobProcessor, validate_guide
 from .storage import ACTIVE_STATUSES, JobRepository
-from .vision import NoopVisionAnalyzer, Sam3VisionAnalyzer
+from .vision import NoopVisionAnalyzer, create_vision_analyzer, validate_vision_runtime
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".webm"}
@@ -44,6 +44,21 @@ class JobCoordinator:
 
         threading.Thread(target=run, name=f"rebuilt-job-{job_id}", daemon=True).start()
 
+    def track_backward(self, job_id: str) -> None:
+        with self._lock:
+            self._active_job_id = job_id
+
+        def run() -> None:
+            try:
+                job = self.repository.get(job_id)
+                self.processor.track_annotated(job_id, job.annotations if job is not None else [])
+            finally:
+                with self._lock:
+                    if self._active_job_id == job_id:
+                        self._active_job_id = None
+
+        threading.Thread(target=run, name=f"rebuilt-track-{job_id}", daemon=True).start()
+
     def busy(self) -> bool:
         with self._lock:
             if self._active_job_id is None:
@@ -55,8 +70,17 @@ class JobCoordinator:
 def create_app(settings: Settings | None = None, *, processor: JobProcessor | None = None) -> FastAPI:
     resolved = settings or Settings.from_env()
     repository = JobRepository(resolved.data_dir)
+    vision_error: AppError | None = None
     if processor is None:
-        analyzer = NoopVisionAnalyzer() if resolved.vision_backend == "noop" else Sam3VisionAnalyzer(resolved)
+        try:
+            validate_vision_runtime(resolved)
+            analyzer = create_vision_analyzer(resolved)
+        except VisionRuntimeError as exc:
+            vision_error = AppError(503, exc.code, exc.message)
+            analyzer = NoopVisionAnalyzer()
+        except AppError as exc:
+            vision_error = exc
+            analyzer = NoopVisionAnalyzer()
         job_processor = JobProcessor(repository, resolved, analyzer=analyzer)
     else:
         job_processor = processor
@@ -66,6 +90,7 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
     app.state.settings = resolved
     app.state.repository = repository
     app.state.coordinator = coordinator
+    app.state.vision_error = vision_error
 
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
@@ -77,10 +102,14 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok"}
+        if vision_error is not None:
+            return {"status": "degraded", "vision": vision_error.code}
+        return {"status": "ok", "vision": "ready"}
 
     @app.post("/jobs", response_model=JobCreated, status_code=202)
     async def create_job(video: Annotated[UploadFile, File(description="A phone recording of the build")]) -> JobCreated:
+        if vision_error is not None:
+            raise vision_error
         if coordinator.busy():
             raise AppError(409, "PROCESSING_BUSY", "Another video is currently being processed.")
         filename = video.filename or "upload"
@@ -122,6 +151,40 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
         if job is None:
             raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
         return job
+
+    @app.put("/jobs/{job_id}/annotations", response_model=JobResponse)
+    async def save_annotations(job_id: str, request: AnnotationRequest) -> JobResponse:
+        if not SAFE_ID.fullmatch(job_id):
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        job = repository.get(job_id)
+        if job is None:
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        if job.status != "annotating":
+            raise AppError(409, "ANNOTATION_NOT_READY", "Annotations can only be edited after frame extraction and before tracking.")
+        names = [annotation.name.strip() for annotation in request.annotations]
+        if any(not name for name in names) or len(set(names)) != len(names):
+            raise AppError(422, "ANNOTATION_INVALID", "Each visible part needs a unique non-empty name.")
+        if any(annotation.frameIndex >= len(job.frames) for annotation in request.annotations):
+            raise AppError(422, "ANNOTATION_FRAME_INVALID", "An annotation refers to a frame that was not extracted.")
+        if any(not annotation.points and annotation.box is None for annotation in request.annotations):
+            raise AppError(422, "ANNOTATION_INVALID", "Each part needs a point or bounding box prompt.")
+        return repository.update(job_id, annotations=request.annotations, error=None)
+
+    @app.post("/jobs/{job_id}/track", response_model=JobResponse, status_code=202)
+    async def track_backward(job_id: str) -> JobResponse:
+        if not SAFE_ID.fullmatch(job_id):
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        job = repository.get(job_id)
+        if job is None:
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        if job.status != "annotating":
+            raise AppError(409, "ANNOTATION_NOT_READY", "This video is not waiting for annotations.")
+        if not job.annotations:
+            raise AppError(422, "ANNOTATIONS_REQUIRED", "Add and save at least one named part before tracking backward.")
+        if coordinator.busy():
+            raise AppError(409, "PROCESSING_BUSY", "Another video is currently being processed.")
+        coordinator.track_backward(job_id)
+        return repository.get(job_id) or job
 
     @app.put("/jobs/{job_id}/guide", response_model=Guide)
     async def save_guide(job_id: str, guide: Guide) -> Guide:

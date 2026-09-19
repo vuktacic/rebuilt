@@ -1,12 +1,97 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+VALID_VISION_BACKENDS = frozenset({"auto", "noop", "sam2", "sam3", "sam3-cuda", "sam3-mlx"})
+
+
+class VisionRuntimeError(RuntimeError):
+    """A stable, operator-facing diagnosis for unavailable local analysis."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _is_rosetta_translated() -> bool:
+    if sys.platform != "darwin":
+        return False
+    completed = subprocess.run(
+        ["sysctl", "-in", "sysctl.proc_translated"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.returncode == 0 and completed.stdout.strip() == "1"
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except ImportError:
+        return False
+
+
+def resolve_vision_backend(
+    settings: "Settings",
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    translated: bool | None = None,
+    cuda_available: bool | None = None,
+) -> str:
+    """Resolve the selected provider without importing optional model packages."""
+    configured = settings.vision_backend.lower()
+    if configured not in VALID_VISION_BACKENDS:
+        valid = ", ".join(sorted(VALID_VISION_BACKENDS))
+        raise VisionRuntimeError("VISION_BACKEND_INVALID", f"Unknown REBUILT_VISION_BACKEND={configured!r}; use one of: {valid}.")
+    if configured == "noop":
+        return "noop"
+
+    if configured == "sam2":
+        return "sam2"
+
+    system = system or platform.system()
+    machine = (machine or platform.machine()).lower()
+    translated = _is_rosetta_translated() if translated is None else translated
+    is_native_macos = system == "Darwin" and machine == "arm64" and not translated
+
+    if configured == "auto":
+        return "sam2"
+    if configured in {"sam3", "sam3-cuda"}:
+        if system == "Darwin":
+            raise VisionRuntimeError(
+                "VISION_BACKEND_INCOMPATIBLE",
+                "sam3-cuda is unavailable on macOS; use REBUILT_VISION_BACKEND=sam3-mlx on native Apple Silicon.",
+            )
+        return "sam3-cuda"
+    if translated:
+        raise VisionRuntimeError(
+            "VISION_ROSETTA_UNSUPPORTED",
+            "sam3-mlx requires a native arm64 Python interpreter; recreate the environment with /opt/homebrew/bin/python3.",
+        )
+    if system == "Darwin" and machine != "arm64":
+        raise VisionRuntimeError(
+            "VISION_INTEL_MAC_UNSUPPORTED",
+            "sam3-mlx requires Apple Silicon; Intel Macs need a supported CUDA host or noop mode.",
+        )
+    if not is_native_macos:
+        raise VisionRuntimeError(
+            "VISION_BACKEND_INCOMPATIBLE",
+            "sam3-mlx is supported only on native arm64 macOS with Apple Metal.",
+        )
+    return "sam3-mlx"
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -60,6 +145,14 @@ class Settings:
     sam3_max_gpu_headroom_mib: int = 500
     analysis_config_version: str = "v2"
     vision_worker: bool = True
+    sam2_checkpoint: Path | None = None
+    sam2_model_config: str = "configs/sam2.1/sam2.1_hiera_s.yaml"
+    mlx_model_dir: Path | None = None
+    mlx_model_revision: str = "38eced50afd50303f207c0165d0299991373c683"
+    mlx_vlm_revision: str = "a5deef1ce4b0b5ef2a01e5a02a36805878a7ee3c"
+    mlx_image_size: int = 336
+    mlx_frame_stride: int = 2
+    fixture_report_dir: Path = Path("reports")
 
     @classmethod
     def from_env(cls, data_dir: Path | None = None) -> "Settings":
@@ -72,6 +165,8 @@ class Settings:
         precision = os.getenv("SAM3_PRECISION", "bf16").lower()
         checkpoint_name = "sam3-bf16.pt" if precision == "bf16" else "sam3.pt"
         local_checkpoint = project_root / ".models" / "sam3" / checkpoint_name
+        local_mlx_model = project_root / ".models" / "mlx-sam3"
+        local_sam2_checkpoint = project_root / ".models" / "sam2" / "sam2.1_hiera_small.pt"
         configured_dir = data_dir or Path(os.getenv("REBUILT_DATA_DIR", ".data"))
         configured_checkpoint = os.getenv("SAM3_CHECKPOINT")
         return cls(
@@ -87,7 +182,7 @@ class Settings:
             analysis_window_seconds=float(os.getenv("REBUILT_ANALYSIS_WINDOW_SECONDS", "10")),
             analysis_overlap_seconds=float(os.getenv("REBUILT_ANALYSIS_OVERLAP_SECONDS", "2")),
             analysis_max_gap_seconds=float(os.getenv("REBUILT_ANALYSIS_MAX_GAP_SECONDS", "1.5")),
-            vision_backend=os.getenv("REBUILT_VISION_BACKEND", "sam3"),
+            vision_backend=os.getenv("REBUILT_VISION_BACKEND", "auto"),
             sam3_checkpoint=Path(configured_checkpoint) if configured_checkpoint else (local_checkpoint if local_checkpoint.is_file() else None),
             sam3_bpe_path=Path(os.environ["SAM3_BPE_PATH"]) if os.getenv("SAM3_BPE_PATH") else None,
             sam3_hf_token_path=Path(os.getenv("HF_TOKEN_FILE", project_root / "private" / ".hf_token")),
@@ -96,4 +191,12 @@ class Settings:
             sam3_max_gpu_headroom_mib=int(os.getenv("SAM3_MIN_GPU_HEADROOM_MIB", "500")),
             analysis_config_version=os.getenv("REBUILT_ANALYSIS_CONFIG_VERSION", "v2"),
             vision_worker=os.getenv("REBUILT_VISION_WORKER", "1").lower() not in {"0", "false", "no"},
+            sam2_checkpoint=Path(os.environ["SAM2_CHECKPOINT"]) if os.getenv("SAM2_CHECKPOINT") else (local_sam2_checkpoint if local_sam2_checkpoint.is_file() else None),
+            sam2_model_config=os.getenv("SAM2_MODEL_CONFIG", "configs/sam2.1/sam2.1_hiera_s.yaml"),
+            mlx_model_dir=Path(os.getenv("MLX_SAM3_MODEL_DIR", local_mlx_model)),
+            mlx_model_revision=os.getenv("MLX_SAM3_MODEL_REVISION", "38eced50afd50303f207c0165d0299991373c683"),
+            mlx_vlm_revision=os.getenv("MLX_VLM_REVISION", "a5deef1ce4b0b5ef2a01e5a02a36805878a7ee3c"),
+            mlx_image_size=max(1, int(os.getenv("MLX_SAM3_IMAGE_SIZE", "336"))),
+            mlx_frame_stride=max(1, int(os.getenv("MLX_SAM3_FRAME_STRIDE", "2"))),
+            fixture_report_dir=Path(os.getenv("REBUILT_FIXTURE_REPORT_DIR", project_root / "reports")),
         )

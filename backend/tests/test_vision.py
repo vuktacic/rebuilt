@@ -15,8 +15,10 @@ from backend.app.vision import (
     AnalysisResult,
     Detection,
     EventDetector,
+    MlxSam3VisionAnalyzer,
     PersistentTrackAssociator,
     Sam3VisionAnalyzer,
+    StableStateChangeDetector,
     WindowTrackStitcher,
     VisionWeightsMissing,
 )
@@ -57,6 +59,38 @@ def test_event_detector_marks_hand_occlusion_uncertain() -> None:
 
     assert events[0].kind == "uncertain_change"
     assert events[0].uncertainty == "vision was occluded during the transition"
+
+
+def test_stable_state_detector_emits_one_change_per_hand_clear_layout() -> None:
+    detections: list[Detection] = []
+    for frame_index in (0, 1):
+        detections.extend([
+            Detection(frame_index, f"base-{frame_index}", "LEGO piece", 0.9, (10, 10, 10, 10)),
+            Detection(frame_index, f"top-{frame_index}", "LEGO piece", 0.9, (20, 10, 10, 10)),
+        ])
+    for frame_index in (2, 3, 6, 7):
+        detections.append(Detection(frame_index, f"hand-{frame_index}", "hand", 0.9, (0, 0, 100, 100)))
+    for frame_index in (4, 5):
+        detections.extend([
+            Detection(frame_index, f"base-{frame_index}", "LEGO piece", 0.9, (10, 10, 10, 10)),
+            Detection(frame_index, f"top-{frame_index}", "LEGO piece", 0.9, (20, 10, 10, 10)),
+            Detection(frame_index, f"loose-{frame_index}", "LEGO piece", 0.9, (60, 10, 10, 10)),
+        ])
+    for frame_index in (8, 9):
+        detections.extend([
+            Detection(frame_index, f"base-{frame_index}", "LEGO piece", 0.9, (10, 10, 10, 10)),
+            Detection(frame_index, f"top-{frame_index}", "LEGO piece", 0.9, (20, 10, 10, 10)),
+            Detection(frame_index, f"loose-a-{frame_index}", "LEGO piece", 0.9, (60, 10, 10, 10)),
+            Detection(frame_index, f"loose-b-{frame_index}", "LEGO piece", 0.9, (100, 10, 10, 10)),
+        ])
+
+    events = StableStateChangeDetector(fps=2).detect(detections, frame_count=10)
+
+    assert [event.kind for event in events] == ["detach", "detach"]
+    assert [(event.beforeFrameId, event.afterFrameId) for event in events] == [
+        ("frame-0000", "frame-0004"),
+        ("frame-0004", "frame-0008"),
+    ]
 
 
 def test_overlapping_reversals_become_one_uncertain_manipulation() -> None:
@@ -121,6 +155,21 @@ def test_associator_keeps_id_after_detector_id_churn() -> None:
     associated = PersistentTrackAssociator(fps=10, max_gap_seconds=1.5).associate(detections)
 
     assert [item.predictor_id for item in associated] == ["track-0001", "track-0001", "track-0001"]
+
+
+def test_associator_never_assigns_two_detections_in_one_frame_to_one_track() -> None:
+    detections = [
+        Detection(0, "piece-a", "LEGO piece", 0.9, (0, 0, 20, 20)),
+        Detection(0, "piece-b", "LEGO piece", 0.9, (100, 0, 20, 20)),
+        Detection(1, "piece-c", "LEGO piece", 0.9, (0, 0, 20, 20)),
+        Detection(2, "piece-a", "LEGO piece", 0.9, (0, 0, 20, 20)),
+        Detection(2, "piece-c", "LEGO piece", 0.9, (100, 0, 20, 20)),
+    ]
+
+    associated = PersistentTrackAssociator(fps=10, max_gap_seconds=1.5).associate(detections)
+    frame_two = [item.predictor_id for item in associated if item.frame_index == 2]
+
+    assert len(frame_two) == len(set(frame_two))
 
 
 def test_window_stitcher_uses_overlap_when_predictor_ids_swap() -> None:
@@ -289,6 +338,74 @@ def test_piece_contact_can_form_cluster_without_assembly_prompt(tmp_path: Path) 
     events, _ = analyzer._events(detections, frame_count=12)
 
     assert any(event.kind == "attach" for event in events)
+
+
+class MlxProviderStub:
+    def track(self, frame_paths: list[Path], prompts: tuple[str, ...]) -> list[list[dict[str, object]]]:
+        assert prompts == ("LEGO piece", "hand")
+        return [
+            [{"object_id": "piece-7", "label": "LEGO piece", "score": 0.8, "bbox": [10, 20, 30, 40], "mask": [[1]]}],
+            [{"object_id": "hand-1", "label": "hand", "score": 0.7, "bbox": [1, 2, 3, 4], "mask": [[1]]}],
+        ]
+
+
+class CapturingMlxProvider:
+    def __init__(self) -> None:
+        self.frame_names: list[str] = []
+
+    def track(self, frame_paths: list[Path], prompts: tuple[str, ...]) -> list[list[dict[str, object]]]:
+        assert prompts == ("LEGO piece", "hand")
+        self.frame_names = [path.name for path in frame_paths]
+        return [
+            [{"object_id": f"piece-{index}", "label": "LEGO piece", "score": 0.8, "bbox": [10, 20, 30, 40], "mask": [[1]]}]
+            for index, _ in enumerate(frame_paths)
+        ]
+
+
+def test_mlx_fast_profile_samples_frames_without_losing_source_indexes(tmp_path: Path) -> None:
+    provider = CapturingMlxProvider()
+    analyzer = MlxSam3VisionAnalyzer(
+        Settings(data_dir=tmp_path, mlx_frame_stride=2),
+        provider=provider,
+    )
+    paths = []
+    for index in range(4):
+        path = tmp_path / f"frame-{index:04d}.jpg"
+        path.write_bytes(b"fake-jpeg")
+        paths.append(path)
+
+    detections = analyzer._run_mlx_window(provider, paths, frame_offset=10)
+
+    assert provider.frame_names == ["frame-0000.jpg", "frame-0002.jpg"]
+    assert [item.frame_index for item in detections] == [10, 12]
+
+
+def test_mlx_adapter_normalizes_raw_provider_output(tmp_path: Path) -> None:
+    analyzer = MlxSam3VisionAnalyzer(Settings(data_dir=tmp_path, mlx_frame_stride=1), provider=MlxProviderStub())
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"frame-{index:04d}.jpg"
+        path.write_bytes(b"fake-jpeg")
+        paths.append(path)
+
+    detections = analyzer._run_mlx_window(MlxProviderStub(), paths, frame_offset=10)
+
+    assert [(item.frame_index, item.predictor_id, item.concept, item.bbox) for item in detections] == [
+        (10, "piece-7", "LEGO piece", (10.0, 20.0, 20.0, 20.0)),
+        (11, "hand-1", "hand", (1.0, 2.0, 2.0, 2.0)),
+    ]
+
+
+def test_mlx_xyxy_boxes_are_normalized_to_internal_xywh(tmp_path: Path) -> None:
+    analyzer = MlxSam3VisionAnalyzer(Settings(data_dir=tmp_path, mlx_frame_stride=1), provider=MlxProviderStub())
+
+    detection = analyzer._parse_mlx_output(
+        {"object_id": "piece-7", "label": "LEGO piece", "score": 0.8, "bbox": [10, 20, 30, 40]},
+        frame_index=0,
+    )
+
+    assert detection is not None
+    assert detection.bbox == (10.0, 20.0, 20.0, 20.0)
 
 
 class AnalysisExtractor:

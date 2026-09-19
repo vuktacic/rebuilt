@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -11,9 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .config import Settings
+from .config import Settings, resolve_vision_backend
 from .errors import AppError
-from .models import AnalysisEvent, AnalysisInfo, TrackSummary
+from .models import AnalysisEvent, AnalysisInfo, PartAnnotation, PartTrack, TrackObservation, TrackSummary
 
 
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ class AnalysisResult:
     events: list[AnalysisEvent]
     tracks: list[TrackSummary]
     analysis: AnalysisInfo
+    part_tracks: list[PartTrack] | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,181 @@ class NoopVisionAnalyzer:
         )
 
 
+class Sam2BackwardVisionAnalyzer:
+    """Prompt SAM2.1 on the final disassembly frame and propagate to frame zero."""
+
+    def __init__(self, settings: Settings, *, provider: Any | None = None):
+        self.settings = settings
+        self._provider = provider
+
+    def analyze_annotated(
+        self,
+        frame_dir: Path,
+        frame_count: int,
+        job_id: str,
+        annotations: list[PartAnnotation],
+        on_progress: Any | None = None,
+    ) -> AnalysisResult:
+        if not annotations:
+            raise AppError(422, "ANNOTATIONS_REQUIRED", "Add at least one named part prompt before tracking backward.")
+        if any(annotation.frameIndex >= frame_count for annotation in annotations):
+            raise AppError(422, "ANNOTATION_FRAME_INVALID", "An annotation refers to a frame that was not extracted.")
+        started = time.monotonic()
+        provider = self._provider or self._load_provider()
+        with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
+            sam2_frame_dir = Path(temporary_dir)
+            for frame_index, source in enumerate(sorted(frame_dir.glob("frame-*.jpg"))):
+                (sam2_frame_dir / f"{frame_index:06d}.jpg").symlink_to(source.resolve())
+            state = provider.init_state(str(sam2_frame_dir))
+        object_ids: dict[str, int] = {}
+        for annotation in annotations:
+            name = annotation.name.strip()
+            object_id = object_ids.setdefault(name, len(object_ids) + 1)
+            points = [[point.x, point.y] for point in annotation.points] or None
+            labels = annotation.labels or ([1] * len(annotation.points) if annotation.points else None)
+            if points is not None and len(points) != len(labels or []):
+                raise AppError(422, "ANNOTATION_INVALID", "Each point prompt needs a matching foreground or background label.")
+            if not points and annotation.box is None:
+                raise AppError(422, "ANNOTATION_INVALID", "Each part needs at least one point or a bounding box.")
+            provider.add_new_points_or_box(
+                state,
+                frame_idx=annotation.frameIndex,
+                obj_id=object_id,
+                points=points,
+                labels=labels,
+                box=list(annotation.box) if annotation.box is not None else None,
+                clear_old_points=False,
+            )
+
+        observations: dict[int, dict[int, TrackObservation]] = {object_id: {} for object_id in object_ids.values()}
+        for processed, (frame_index, returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
+            state,
+            start_frame_idx=frame_count - 1,
+            reverse=True,
+        ), start=1):
+            if on_progress is not None:
+                on_progress(min(1.0, processed / frame_count))
+            for object_id, mask_logits_for_object in zip(returned_ids, self._mask_items(mask_logits), strict=False):
+                numeric_id = int(object_id)
+                if numeric_id in observations:
+                    observations[numeric_id][int(frame_index)] = self._observation(int(frame_index), mask_logits_for_object)
+
+        tracks: list[PartTrack] = []
+        for name, object_id in object_ids.items():
+            chronological = [
+                observations[object_id].get(frame_index, TrackObservation(frameIndex=frame_index, visible=False))
+                for frame_index in range(frame_count)
+            ]
+            attachment_start, attachment_end = self._attachment_range(chronological)
+            tracks.append(PartTrack(
+                partId=object_id,
+                name=name,
+                observations=chronological,
+                attachmentStartFrame=attachment_start,
+                attachmentEndFrame=attachment_end,
+            ))
+        events = self._events_from_part_tracks(tracks)
+        elapsed = time.monotonic() - started
+        summaries = [
+            TrackSummary(
+                trackId=f"part:{track.partId}",
+                concept=track.name,
+                firstTimestampSeconds=0,
+                lastTimestampSeconds=max(0, frame_count - 1) / self.settings.analysis_fps,
+                visibility="visible" if any(item.visible for item in track.observations) else "lost",
+                membership="attached" if track.attachmentStartFrame is not None else "unknown",
+            )
+            for track in tracks
+        ]
+        return AnalysisResult(
+            events=events,
+            tracks=summaries,
+            part_tracks=tracks,
+            analysis=AnalysisInfo(
+                backend="sam2.1-backward",
+                modelVersion=self.settings.sam2_model_config,
+                configVersion=self.settings.analysis_config_version,
+                durationSeconds=elapsed,
+                metrics={"frames": float(frame_count), "parts": float(len(tracks)), "events": float(len(events))},
+            ),
+        )
+
+    def _load_provider(self) -> Any:
+        checkpoint = self.settings.sam2_checkpoint
+        if checkpoint is None or not checkpoint.is_file():
+            raise VisionWeightsMissing("The configured SAM2.1 checkpoint is unavailable; run scripts/bootstrap_sam2.sh.")
+        try:
+            import torch
+            from sam2.build_sam import build_sam2_video_predictor
+        except ImportError as exc:
+            raise VisionUnavailable("SAM2.1 dependencies are unavailable; run scripts/bootstrap_sam2.sh.") from exc
+        device = "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            return build_sam2_video_predictor(self.settings.sam2_model_config, str(checkpoint), device=device)
+        except Exception as exc:
+            raise VisionUnavailable(f"SAM2.1 could not be loaded: {type(exc).__name__}") from exc
+
+    @staticmethod
+    def _mask_items(mask_logits: Any) -> list[Any]:
+        if hasattr(mask_logits, "detach"):
+            return [mask_logits[index] for index in range(len(mask_logits))]
+        if isinstance(mask_logits, (list, tuple)):
+            return list(mask_logits)
+        return [mask_logits]
+
+    @staticmethod
+    def _observation(frame_index: int, mask_logits: Any) -> TrackObservation:
+        try:
+            import numpy as np
+
+            mask = mask_logits.detach().cpu().numpy() if hasattr(mask_logits, "detach") else mask_logits
+            binary = np.asarray(mask).squeeze() > 0
+            ys, xs = np.where(binary)
+            if not len(xs):
+                return TrackObservation(frameIndex=frame_index, visible=False)
+            x0, x1, y0, y1 = float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max())
+            orientation = None
+            if len(xs) >= 2:
+                values, vectors = np.linalg.eigh(np.cov(np.stack((xs, ys))))
+                axis = vectors[:, int(np.argmax(values))]
+                orientation = float(math.degrees(math.atan2(axis[1], axis[0])))
+            return TrackObservation(
+                frameIndex=frame_index,
+                centroid=(float(xs.mean()), float(ys.mean())),
+                bbox=(x0, y0, x1 - x0 + 1, y1 - y0 + 1),
+                orientationDegrees=orientation,
+                visible=True,
+            )
+        except (ImportError, TypeError, ValueError, AttributeError):
+            return TrackObservation(frameIndex=frame_index, visible=False)
+
+    @staticmethod
+    def _attachment_range(observations: list[TrackObservation]) -> tuple[int | None, int | None]:
+        visible = [item.frameIndex for item in observations if item.visible]
+        if not visible or visible[0] == 0:
+            return None, None
+        return visible[0] - 1, visible[0]
+
+    def _events_from_part_tracks(self, tracks: list[PartTrack]) -> list[AnalysisEvent]:
+        events: list[AnalysisEvent] = []
+        for track in tracks:
+            if track.attachmentStartFrame is None or track.attachmentEndFrame is None:
+                continue
+            events.append(AnalysisEvent(
+                eventId=f"event-{len(events) + 1:04d}",
+                kind="uncertain_change",
+                startTimestampSeconds=track.attachmentStartFrame / self.settings.analysis_fps,
+                endTimestampSeconds=track.attachmentEndFrame / self.settings.analysis_fps,
+                affectedTrackIds=[f"part:{track.partId}"],
+                beforeFrameId=f"frame-{track.attachmentStartFrame:04d}",
+                afterFrameId=f"frame-{track.attachmentEndFrame:04d}",
+                evidenceStrength=0.55,
+                uncertainty="The attachment interval was inferred from reverse-track visibility; review the overlay before using this step.",
+                evidence=f"{track.name} transitions from isolated to occluded or attached.",
+            ))
+        return events
+
+
 class VisionUnavailable(AppError):
     def __init__(self, message: str):
         super().__init__(503, "VISION_UNAVAILABLE", message)
@@ -77,6 +255,181 @@ class VisionUnavailable(AppError):
 class VisionWeightsMissing(AppError):
     def __init__(self, message: str = "The configured SAM3 checkpoint is unavailable."):
         super().__init__(503, "VISION_WEIGHTS_MISSING", message)
+
+
+class MlxSam3VisionAnalyzer:
+    """Apple-Silicon adapter that keeps MLX details behind ``VisionAnalyzer``."""
+
+    PROMPTS = ("LEGO piece", "hand")
+
+    def __init__(self, settings: Settings, *, provider: Any | None = None):
+        self.settings = settings
+        self._shared = Sam3VisionAnalyzer(settings)
+        self._provider = provider
+
+    def analyze(self, frame_dir: Path, frame_count: int, job_id: str) -> AnalysisResult:
+        started = time.monotonic()
+        provider = self._provider or self._load_provider()
+        frame_paths = sorted(frame_dir.glob("frame-*.jpg"))
+        if len(frame_paths) < frame_count:
+            raise VisionUnavailable("The MLX runtime did not receive every extracted frame.")
+        window_size = max(1, int(round(self.settings.analysis_window_seconds * self.settings.analysis_fps)))
+        overlap = max(0, min(window_size - 1, int(round(self.settings.analysis_overlap_seconds * self.settings.analysis_fps))))
+        step = max(1, window_size - overlap)
+        detections: list[Detection] = []
+        stitcher = WindowTrackStitcher()
+        windows = 0
+        for start in range(0, frame_count, step):
+            end = min(frame_count, start + window_size)
+            detections = stitcher.add(self._run_mlx_window(provider, frame_paths[start:end], start))
+            windows += 1
+            if end == frame_count:
+                break
+        events, tracks = self._shared._events(detections, frame_count, prefer_stable_states=True)
+        events = self._shared._select_screenshots(events, frame_dir, detections)
+        elapsed = time.monotonic() - started
+        return AnalysisResult(
+            events=events,
+            tracks=tracks,
+            analysis=AnalysisInfo(
+                backend="sam3-mlx",
+                modelVersion=f"mlx-community/sam3-mxfp4@{self.settings.mlx_model_revision}",
+                configVersion=self.settings.analysis_config_version,
+                durationSeconds=elapsed,
+                metrics={
+                    "frames": float(frame_count),
+                    "detections": float(len(detections)),
+                    "tracks": float(len(tracks)),
+                    "events": float(len(events)),
+                    "windows": float(windows),
+                },
+            ),
+        )
+
+    def _load_provider(self) -> Any:
+        model_dir = self.settings.mlx_model_dir
+        if model_dir is None or not (model_dir / "config.json").is_file():
+            raise VisionWeightsMissing("The configured MLX SAM3 model snapshot is unavailable; run scripts/bootstrap_mlx_sam3.sh.")
+        try:
+            import mlx.core as mx
+            from mlx_vlm import load
+            from mlx_vlm.models.sam3.generate import Sam3Predictor, SimpleTracker, predict_multi
+        except ImportError as exc:
+            raise VisionUnavailable("MLX SAM3 dependencies are unavailable; run scripts/bootstrap_mlx_sam3.sh.") from exc
+        if not mx.metal.is_available():
+            raise VisionUnavailable("Apple Metal is unavailable for the MLX SAM3 runtime.")
+        try:
+            model, processor = load(str(model_dir), trust_remote_code=True)
+        except Exception as exc:
+            raise VisionUnavailable(f"MLX SAM3 could not be loaded: {type(exc).__name__}") from exc
+        processor.image_size = self.settings.mlx_image_size
+        return _MlxSam3Provider(Sam3Predictor(model, processor, score_threshold=0.15), SimpleTracker(), predict_multi)
+
+    def _run_mlx_window(self, provider: Any, frame_paths: list[Path], frame_offset: int) -> list[Detection]:
+        sampled = [
+            (local_index, path)
+            for local_index, path in enumerate(frame_paths)
+            if local_index % self.settings.mlx_frame_stride == 0
+        ]
+        try:
+            raw_frames = provider.track([path for _, path in sampled], self.PROMPTS)
+        except AppError:
+            raise
+        except Exception as exc:
+            raise VisionUnavailable(f"MLX SAM3 inference failed: {type(exc).__name__}") from exc
+        if len(raw_frames) != len(sampled):
+            raise VisionUnavailable("MLX SAM3 returned an incomplete frame prediction.")
+        detections: list[Detection] = []
+        for (local_index, _), raw_items in zip(sampled, raw_frames, strict=True):
+            if not isinstance(raw_items, list):
+                raise VisionUnavailable("MLX SAM3 returned an invalid frame prediction.")
+            for raw in raw_items:
+                detection = self._parse_mlx_output(raw, frame_offset + local_index)
+                if detection is not None:
+                    detections.append(detection)
+        return detections
+
+    def _parse_mlx_output(self, output: Any, frame_index: int) -> Detection | None:
+        if not isinstance(output, dict):
+            return None
+        raw_bbox = output.get("bbox")
+        bbox = raw_bbox
+        if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+            try:
+                left, top, right, bottom = (float(value) for value in raw_bbox)
+                bbox = [left, top, max(0.0, right - left), max(0.0, bottom - top)]
+            except (TypeError, ValueError):
+                bbox = raw_bbox
+        return self._shared._parse_output(
+            {
+                "object_id": output.get("object_id"),
+                "concept": output.get("label"),
+                "score": output.get("score"),
+                "bbox": bbox,
+                "mask": output.get("mask"),
+            },
+            frame_index,
+        )
+
+
+class _MlxSam3Provider:
+    """Thin wrapper around the pinned MLX-VLM raw Python contract."""
+
+    def __init__(self, predictor: Any, tracker: Any, predict_multi: Any):
+        self.predictor = predictor
+        self.tracker = tracker
+        self.predict_multi = predict_multi
+
+    def track(self, frame_paths: list[Path], prompts: tuple[str, ...]) -> list[list[dict[str, Any]]]:
+        from PIL import Image
+
+        frames: list[list[dict[str, Any]]] = []
+        for path in frame_paths:
+            with Image.open(path) as image:
+                result = self.tracker.update(self.predict_multi(self.predictor, image.convert("RGB"), list(prompts), score_threshold=0.15))
+            labels = result.labels or ["LEGO piece"] * len(result.scores)
+            ids = result.track_ids if result.track_ids is not None else range(len(result.scores))
+            frames.append([
+                {
+                    "object_id": str(object_id),
+                    "label": label,
+                    "score": float(score),
+                    "bbox": [float(value) for value in box],
+                    "mask": mask,
+                }
+                for object_id, label, score, box, mask in zip(ids, labels, result.scores, result.boxes, result.masks)
+            ])
+        return frames
+
+
+def create_vision_analyzer(settings: Settings) -> VisionAnalyzer:
+    backend = resolve_vision_backend(settings)
+    if backend == "noop":
+        return NoopVisionAnalyzer()
+    if backend == "sam2":
+        return Sam2BackwardVisionAnalyzer(settings)  # type: ignore[return-value]
+    if backend == "sam3-mlx":
+        return MlxSam3VisionAnalyzer(settings)
+    return Sam3VisionAnalyzer(settings)
+
+
+def validate_vision_runtime(settings: Settings) -> str:
+    """Validate cheap startup prerequisites without loading a multi-GB model."""
+    backend = resolve_vision_backend(settings)
+    if backend == "sam2":
+        if importlib.util.find_spec("sam2") is None:
+            raise VisionUnavailable("SAM2.1 dependencies are unavailable; run scripts/bootstrap_sam2.sh.")
+        if settings.sam2_checkpoint is None or not settings.sam2_checkpoint.is_file():
+            raise VisionWeightsMissing("The configured SAM2.1 checkpoint is unavailable; run scripts/bootstrap_sam2.sh.")
+        return backend
+    if backend != "sam3-mlx":
+        return backend
+    if importlib.util.find_spec("mlx") is None or importlib.util.find_spec("mlx_vlm") is None:
+        raise VisionUnavailable("MLX SAM3 dependencies are unavailable; run scripts/bootstrap_mlx_sam3.sh.")
+    model_dir = settings.mlx_model_dir
+    if model_dir is None or not (model_dir / "config.json").is_file():
+        raise VisionWeightsMissing("The configured MLX SAM3 model snapshot is unavailable; run scripts/bootstrap_mlx_sam3.sh.")
+    return backend
 
 
 def _iou(left: Detection, right: Detection) -> float:
@@ -143,23 +496,36 @@ class PersistentTrackAssociator:
         active: dict[str, Detection] = {}
         original_ids: dict[tuple[str, str], str] = {}
         associated: list[Detection] = []
+        current_frame: int | None = None
+        used_tracks: set[str] = set()
         for detection in sorted(detections, key=lambda item: (item.frame_index, item.concept, item.predictor_id)):
+            if detection.frame_index != current_frame:
+                current_frame = detection.frame_index
+                used_tracks = set()
             key = (detection.concept, detection.predictor_id)
             chosen = original_ids.get(key)
-            if chosen and chosen in active and detection.frame_index - active[chosen].frame_index <= self.max_gap_frames:
-                track_id = chosen
-            else:
+            if not (
+                chosen
+                and chosen not in used_tracks
+                and chosen in active
+                and detection.frame_index - active[chosen].frame_index <= self.max_gap_frames
+            ):
+                chosen = None
+            if chosen is None:
                 candidates = [
                     (track_id, previous)
                     for track_id, previous in active.items()
-                    if previous.concept == detection.concept
+                    if track_id not in used_tracks
+                    and previous.concept == detection.concept
                     and 0 < detection.frame_index - previous.frame_index <= self.max_gap_frames
                 ]
-                track_id = self._best_candidate(detection, candidates)
-                if track_id is None:
-                    track_id = f"track-{next_id:04d}"
+                chosen = self._best_candidate(detection, candidates)
+                if chosen is None:
+                    chosen = f"track-{next_id:04d}"
                     next_id += 1
-                original_ids[key] = track_id
+                original_ids[key] = chosen
+            track_id = chosen
+            used_tracks.add(track_id)
             current = Detection(**{**detection.__dict__, "predictor_id": track_id})
             active[track_id] = current
             associated.append(current)
@@ -256,6 +622,126 @@ class WindowTrackStitcher:
         if best < 0.05:
             return None
         return sum(similarities) / len(similarities) + best
+
+
+class StableStateChangeDetector:
+    """Detect persistent layout changes between hand-clear workspace states."""
+
+    def __init__(self, fps: float = 10.0, score_threshold: float = 0.45, max_state_gap_seconds: float = 1.5):
+        self.fps = fps
+        self.score_threshold = score_threshold
+        self.max_state_gap_frames = max(1, int(round(fps * max_state_gap_seconds)))
+
+    def detect(self, detections: list[Detection], frame_count: int) -> list[AnalysisEvent]:
+        pieces_by_frame: dict[int, list[Detection]] = {}
+        hands_by_frame: dict[int, list[Detection]] = {}
+        for detection in detections:
+            if detection.score < self.score_threshold:
+                continue
+            target = hands_by_frame if detection.concept == "hand" else pieces_by_frame
+            target.setdefault(detection.frame_index, []).append(detection)
+
+        clear_frames = sorted(
+            frame_index
+            for frame_index, pieces in pieces_by_frame.items()
+            if len(pieces) >= 2 and not hands_by_frame.get(frame_index)
+        )
+        if not clear_frames:
+            return []
+
+        hand_frames = set(hands_by_frame)
+        runs: list[list[int]] = [[clear_frames[0]]]
+        for frame_index in clear_frames[1:]:
+            previous_frame = runs[-1][-1]
+            hand_intervened = any(previous_frame < hand_frame < frame_index for hand_frame in hand_frames)
+            if frame_index - previous_frame <= self.max_state_gap_frames and not hand_intervened:
+                runs[-1].append(frame_index)
+            else:
+                runs.append([frame_index])
+
+        states = [
+            (run[0], self._components(pieces_by_frame[run[0]]))
+            for run in runs
+        ]
+        events: list[AnalysisEvent] = []
+        for (before_frame, before), (after_frame, after) in zip(states, states[1:], strict=False):
+            if not self._changed(before, after):
+                continue
+            detached = len(after) > len(before)
+            events.append(
+                AnalysisEvent(
+                    eventId=f"event-{len(events) + 1:04d}",
+                    kind="detach" if detached else "uncertain_change",
+                    startTimestampSeconds=before_frame / self.fps,
+                    endTimestampSeconds=after_frame / self.fps,
+                    affectedTrackIds=[
+                        f"LEGO piece:{track_id}"
+                        for component in after
+                        for track_id in component[4]
+                    ],
+                    beforeFrameId=f"frame-{before_frame:04d}",
+                    afterFrameId=f"frame-{after_frame:04d}",
+                    evidenceStrength=0.75 if detached else 0.6,
+                    uncertainty="individual identity was interrupted during hand manipulation; the change is grounded in persistent hand-clear layouts",
+                    evidence=(
+                        "a connected layout became more separated after the part was placed down"
+                        if detached
+                        else "the stable hand-clear part layout changed after a manipulation interval"
+                    ),
+                )
+            )
+        return events
+
+    @staticmethod
+    def _components(detections: list[Detection]) -> list[tuple[float, float, float, float, tuple[str, ...]]]:
+        parents = list(range(len(detections)))
+
+        def root(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for left_index, left in enumerate(detections):
+            for right_index in range(left_index):
+                if _pieces_connected(left, detections[right_index]):
+                    left_root = root(left_index)
+                    right_root = root(right_index)
+                    parents[left_root] = right_root
+
+        grouped: dict[int, list[Detection]] = {}
+        for index, detection in enumerate(detections):
+            grouped.setdefault(root(index), []).append(detection)
+
+        components = []
+        for group in grouped.values():
+            left = min(item.bbox[0] for item in group)
+            top = min(item.bbox[1] for item in group)
+            right = max(item.bbox[0] + item.bbox[2] for item in group)
+            bottom = max(item.bbox[1] + item.bbox[3] for item in group)
+            components.append((left, top, right, bottom, tuple(item.predictor_id for item in group)))
+        return sorted(components, key=lambda item: (item[0] + item[2], item[1] + item[3]))
+
+    @staticmethod
+    def _changed(
+        before: list[tuple[float, float, float, float, tuple[str, ...]]],
+        after: list[tuple[float, float, float, float, tuple[str, ...]]],
+    ) -> bool:
+        if len(before) != len(after):
+            return True
+        extent = max(
+            [coordinate for component in before + after for coordinate in component[:4]] + [1.0]
+        )
+        for left, right in zip(before, after, strict=True):
+            left_center = ((left[0] + left[2]) / 2, (left[1] + left[3]) / 2)
+            right_center = ((right[0] + right[2]) / 2, (right[1] + right[3]) / 2)
+            movement = ((left_center[0] - right_center[0]) ** 2 + (left_center[1] - right_center[1]) ** 2) ** 0.5
+            left_area = max(1.0, (left[2] - left[0]) * (left[3] - left[1]))
+            right_area = max(1.0, (right[2] - right[0]) * (right[3] - right[1]))
+            area_ratio = min(left_area, right_area) / max(left_area, right_area)
+            if movement / extent > 0.08 or area_ratio < 0.55:
+                return True
+        return False
 
 
 class EventDetector:
@@ -839,7 +1325,13 @@ class Sam3VisionAnalyzer:
         except (ImportError, TypeError, ValueError, AttributeError):
             return None
 
-    def _events(self, detections: list[Detection], frame_count: int) -> tuple[list[AnalysisEvent], list[TrackSummary]]:
+    def _events(
+        self,
+        detections: list[Detection],
+        frame_count: int,
+        *,
+        prefer_stable_states: bool = False,
+    ) -> tuple[list[AnalysisEvent], list[TrackSummary]]:
         assemblies = [item for item in detections if "assembly" in item.concept.lower()]
         hands = [item for item in detections if "hand" in item.concept.lower()]
         max_gap_frames = max(1, int(round(self.settings.analysis_fps * self.settings.analysis_max_gap_seconds)))
@@ -890,7 +1382,12 @@ class Sam3VisionAnalyzer:
                 "visible": item.visible and not group_gap,
                 "occluded_by_hand": hand_occluded,
             }))
-        return EventDetector(
+        legacy_events, tracks = EventDetector(
             self.settings.analysis_fps,
             max_gap_seconds=self.settings.analysis_max_gap_seconds,
         ).detect(enriched, frame_count)
+        if prefer_stable_states:
+            state_events = StableStateChangeDetector(self.settings.analysis_fps).detect(detections, frame_count)
+            if state_events:
+                return state_events, tracks
+        return legacy_events, tracks

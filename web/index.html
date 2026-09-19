@@ -87,6 +87,19 @@
         </div>
       </section>
 
+      <section id="annotation-panel" class="result-section annotation-panel" aria-labelledby="annotation-heading" hidden>
+        <div class="section-heading"><div class="section-index"><span>03</span></div><div class="section-title"><p class="stage-kicker">Manual prompt</p><h2 id="annotation-heading">Name parts on the final frame</h2><p class="panel-copy">The scrubber starts at the fully disassembled final frame. Click a visible part, name it, then add it. You can move to an earlier frame for one fallback prompt.</p></div></div>
+        <div class="annotation-workspace">
+          <div class="annotation-stage"><img id="annotation-image" alt="Selected extracted frame for part annotation" /><div id="annotation-markers" class="annotation-markers"></div></div>
+          <div class="annotation-controls"><label>Frame <input id="annotation-frame" type="range" min="0" value="0" /><span id="annotation-frame-label"></span></label><label>Part name <input id="annotation-name" type="text" placeholder="e.g. side panel" /></label><p id="annotation-hint" class="annotation-hint">Click a part in the image, then add the named point.</p><button id="add-annotation-button" class="button button-secondary" type="button" disabled>Add named point</button><div id="annotation-list" class="annotation-list"></div><button id="track-backward-button" class="button button-primary" type="button" disabled>Track backward ↗</button></div>
+        </div>
+      </section>
+
+      <section id="tracking-preview-panel" class="result-section annotation-panel" aria-labelledby="tracking-preview-heading" hidden>
+        <div class="section-heading"><div class="section-index"><span>04</span></div><div class="section-title"><p class="stage-kicker">Tracking review</p><h2 id="tracking-preview-heading">Reverse-track overlay</h2><p class="panel-copy">Scrub the source video to check each named part’s propagated bounding box before relying on generated instructions.</p></div></div>
+        <div class="annotation-workspace"><div class="annotation-stage"><img id="tracking-image" alt="Tracked part overlay frame" /><div id="tracking-markers" class="annotation-markers"></div></div><div class="annotation-controls"><label>Frame <input id="tracking-frame" type="range" min="0" value="0" /><span id="tracking-frame-label"></span></label><div id="tracking-legend" class="annotation-list"></div></div></div>
+      </section>
+
       <section id="timeline-panel" class="result-section timeline-panel" aria-labelledby="timeline-heading" hidden>
         <div class="section-heading">
           <div class="section-index"><span>03</span></div>

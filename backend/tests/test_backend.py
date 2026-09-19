@@ -10,9 +10,10 @@ import pytest
 from backend.app.config import Settings
 from backend.app.errors import AppError
 from backend.app.main import create_app
-from backend.app.models import Frame, Guide, GuideStep
+from backend.app.models import AnalysisInfo, Frame, Guide, GuideStep
 from backend.app.processing import ExtractedFrames, JobProcessor, validate_guide
 from backend.app.storage import JobRepository
+from backend.app.vision import AnalysisResult
 
 
 class FakeExtractor:
@@ -39,6 +40,20 @@ class FailingGenerator:
 class InvalidGenerator:
     def generate(self, frames: list[Frame], frame_paths: list[Path]) -> Guide:
         return Guide(title="Invalid", steps=[GuideStep(text="Invented frame.", frameId="missing")])
+
+
+class NoEventAnalyzer:
+    def analyze(self, frame_dir: Path, frame_count: int, job_id: str) -> AnalysisResult:
+        return AnalysisResult(
+            events=[],
+            tracks=[],
+            analysis=AnalysisInfo(backend="test", modelVersion="test", configVersion="test"),
+        )
+
+
+class NeverCalledGenerator:
+    def generate(self, frames: list[Frame], frame_paths: list[Path]) -> Guide:
+        raise AssertionError("a no-event analysis should not generate an unsupported guide")
 
 
 def make_app(tmp_path: Path):
@@ -134,6 +149,30 @@ def test_incomplete_model_frame_reference_fails_the_job(tmp_path: Path) -> None:
     failed = wait_for_ready(app, created.json()["jobId"])
     assert failed["status"] == "failed"
     assert failed["error"]["code"] == "INVALID_GUIDE"
+
+
+def test_no_event_analysis_returns_a_reviewable_draft_instead_of_failing(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path)
+    repository = JobRepository(tmp_path)
+    app = create_app(
+        settings,
+        processor=JobProcessor(repository, settings, FakeExtractor(), NeverCalledGenerator(), NoEventAnalyzer()),
+    )
+
+    created = asyncio.run(request(app, "POST", "/jobs", files={"video": ("build.mp4", b"video", "video/mp4")}))
+    job = wait_for_ready(app, created.json()["jobId"])
+
+    assert job["status"] == "ready"
+    assert job["events"] == []
+    assert job["error"] is None
+    assert job["guide"] == {
+        "title": "Build needs review",
+        "steps": [{
+            "text": "No reliable physical change was detected automatically. Review the recording and replace this draft with the first verified build step.",
+            "frameId": "frame-0001",
+            "uncertainty": "The local tracker could not maintain enough evidence for a confident change history.",
+        }],
+    }
 
 
 def test_interrupted_jobs_are_marked_failed(tmp_path: Path) -> None:

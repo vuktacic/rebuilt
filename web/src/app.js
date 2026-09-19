@@ -6,6 +6,7 @@ const mockEnabled = params.get("mock") === "1" || params.get("mock") === "true";
 const api = createApiClient({ mock: mockEnabled });
 let state = initialState(api.mode);
 let pollController = null;
+let selectedAnnotationPoint = null;
 
 const elements = {
   modeBanner: document.querySelector("#mode-banner"),
@@ -30,6 +31,22 @@ const elements = {
   saveError: document.querySelector("#save-error"),
   addStepButton: document.querySelector("#add-step-button"),
   resetButton: document.querySelector("#reset-button"),
+  annotationPanel: document.querySelector("#annotation-panel"),
+  annotationImage: document.querySelector("#annotation-image"),
+  annotationMarkers: document.querySelector("#annotation-markers"),
+  annotationFrame: document.querySelector("#annotation-frame"),
+  annotationFrameLabel: document.querySelector("#annotation-frame-label"),
+  annotationName: document.querySelector("#annotation-name"),
+  annotationHint: document.querySelector("#annotation-hint"),
+  addAnnotationButton: document.querySelector("#add-annotation-button"),
+  annotationList: document.querySelector("#annotation-list"),
+  trackBackwardButton: document.querySelector("#track-backward-button"),
+  trackingPreviewPanel: document.querySelector("#tracking-preview-panel"),
+  trackingImage: document.querySelector("#tracking-image"),
+  trackingMarkers: document.querySelector("#tracking-markers"),
+  trackingFrame: document.querySelector("#tracking-frame"),
+  trackingFrameLabel: document.querySelector("#tracking-frame-label"),
+  trackingLegend: document.querySelector("#tracking-legend"),
 };
 
 if (api.mode === "mock") {
@@ -66,6 +83,8 @@ function render() {
   elements.progressBar.style.width = `${progressPercent(state)}%`;
   elements.statusDetail.textContent = detailText(state);
   showError(elements.errorBox, state.error);
+  renderAnnotation();
+  renderTrackingPreview();
 
   elements.timelinePanel.hidden = state.events.length === 0;
   if (state.events.length) renderEvents();
@@ -80,6 +99,74 @@ function render() {
     renderSteps();
   }
   showError(elements.saveError, state.saveError);
+}
+
+function selectedFrame(frames, input) {
+  return frames[Math.max(0, Math.min(frames.length - 1, Number(input.value) || 0))];
+}
+
+function renderAnnotation() {
+  const active = state.status === "annotating";
+  elements.annotationPanel.hidden = !active;
+  if (!active || !state.frames.length) return;
+  elements.annotationFrame.max = String(state.frames.length - 1);
+  if (!elements.annotationFrame.dataset.initialized) {
+    elements.annotationFrame.value = String(state.frames.length - 1);
+    elements.annotationFrame.dataset.initialized = "true";
+  }
+  const frame = selectedFrame(state.frames, elements.annotationFrame);
+  if (elements.annotationImage.dataset.frameId !== frame.frameId) {
+    elements.annotationImage.src = frame.imageUrl;
+    elements.annotationImage.dataset.frameId = frame.frameId;
+  }
+  elements.annotationFrameLabel.textContent = `${frame.frameId} · ${formatTime(frame.timestampSeconds)}`;
+  elements.annotationMarkers.replaceChildren();
+  [...state.annotations, ...(selectedAnnotationPoint ? [{ name: "new", frameIndex: Number(elements.annotationFrame.value), points: [selectedAnnotationPoint] }] : [])]
+    .filter((item) => item.frameIndex === Number(elements.annotationFrame.value)).forEach((item) => {
+      const point = item.points[0];
+      if (!point) return;
+      const marker = document.createElement("i");
+      marker.className = "annotation-point";
+      marker.style.left = `${point.x / elements.annotationImage.naturalWidth * 100}%`;
+      marker.style.top = `${point.y / elements.annotationImage.naturalHeight * 100}%`;
+      elements.annotationMarkers.append(marker);
+    });
+  elements.addAnnotationButton.disabled = !selectedAnnotationPoint || !elements.annotationName.value.trim();
+  elements.trackBackwardButton.disabled = state.annotations.length === 0;
+  elements.annotationList.replaceChildren(...state.annotations.map((item) => {
+    const line = document.createElement("p");
+    line.textContent = `${item.name} · frame ${item.frameIndex + 1}`;
+    return line;
+  }));
+}
+
+function renderTrackingPreview() {
+  const active = state.partTracks.length > 0;
+  elements.trackingPreviewPanel.hidden = !active;
+  if (!active || !state.frames.length) return;
+  elements.trackingFrame.max = String(state.frames.length - 1);
+  const frame = selectedFrame(state.frames, elements.trackingFrame);
+  elements.trackingImage.src = frame.imageUrl;
+  elements.trackingFrameLabel.textContent = `${frame.frameId} · ${formatTime(frame.timestampSeconds)}`;
+  elements.trackingMarkers.replaceChildren();
+  state.partTracks.forEach((track) => {
+    const observation = track.observations.find((item) => item.frameIndex === Number(elements.trackingFrame.value));
+    if (!observation?.visible || !observation.bbox || !elements.trackingImage.naturalWidth) return;
+    const [x, y, width, height] = observation.bbox;
+    const box = document.createElement("div");
+    box.className = "annotation-box";
+    box.style.left = `${x / elements.trackingImage.naturalWidth * 100}%`;
+    box.style.top = `${y / elements.trackingImage.naturalHeight * 100}%`;
+    box.style.width = `${width / elements.trackingImage.naturalWidth * 100}%`;
+    box.style.height = `${height / elements.trackingImage.naturalHeight * 100}%`;
+    box.innerHTML = `<span>${track.name}</span>`;
+    elements.trackingMarkers.append(box);
+  });
+  elements.trackingLegend.replaceChildren(...state.partTracks.map((track) => {
+    const line = document.createElement("p");
+    line.textContent = track.attachmentStartFrame === null ? `${track.name} · no confident attachment range` : `${track.name} · joins around frames ${track.attachmentStartFrame + 1}–${track.attachmentEndFrame + 1}`;
+    return line;
+  }));
 }
 
 function renderEvents() {
@@ -225,11 +312,14 @@ function pillText(current) {
 
 function progressPercent(current) {
   if (current.phase === "uploading") return 18;
-  return { queued: 20, extracting: 40, analyzing: 68, generating: 84, ready: 100, failed: 100 }[current.status] || 0;
+  if (current.status === "analyzing" && typeof current.trackingProgress === "number") return 55 + Math.round(current.trackingProgress * 29);
+  return { queued: 20, extracting: 40, annotating: 52, analyzing: 68, generating: 84, ready: 100, failed: 100 }[current.status] || 0;
 }
 
 function detailText(current) {
   if (current.phase === "uploading") return `Uploading ${current.uploadName || "your video"}…`;
+  if (current.status === "annotating") return "Click and name every clearly separated part. The final frame is selected by default; use an earlier frame only as a fallback.";
+  if (current.status === "analyzing" && typeof current.trackingProgress === "number") return `SAM2 is propagating masks backward: ${Math.round(current.trackingProgress * 100)}% complete. You can leave this tab open.`;
   if (current.phase === "processing") return "This page checks for progress every two seconds. You can leave this tab open.";
   if (current.phase === "ready") return `${current.frames.length} extracted frame${current.frames.length === 1 ? "" : "s"} · review the wording before you save.`;
   if (current.phase === "error") return "Correct the issue or start another build. Live errors are shown as returned by the server.";
@@ -308,6 +398,42 @@ function normalizeError(error) {
   return { code: "REQUEST_FAILED", message: error?.message || "Something went wrong." };
 }
 
+function addAnnotation() {
+  const name = elements.annotationName.value.trim();
+  if (!selectedAnnotationPoint || !name) {
+    elements.annotationHint.textContent = "Click a part and enter a name before adding it.";
+    return;
+  }
+  const index = state.annotations.findIndex((item) => item.name.toLowerCase() === name.toLowerCase());
+  const annotations = [...state.annotations];
+  if (index >= 0) {
+    annotations[index] = {
+      ...annotations[index],
+      points: [...annotations[index].points, selectedAnnotationPoint],
+      labels: [...annotations[index].labels, 1],
+    };
+  } else {
+    annotations.push({ name, frameIndex: Number(elements.annotationFrame.value), points: [selectedAnnotationPoint], labels: [1] });
+  }
+  state = { ...state, annotations };
+  selectedAnnotationPoint = null;
+  elements.annotationName.value = "";
+  elements.annotationHint.textContent = index >= 0 ? "Point added to the existing named part." : "Part added. Click another part or scrub to an earlier fallback frame.";
+  render();
+}
+
+async function trackBackward() {
+  try {
+    const saved = await api.saveAnnotations(state.jobId, state.annotations);
+    dispatch({ type: "JOB_UPDATE", job: saved });
+    const started = await api.trackBackward(state.jobId);
+    dispatch({ type: "JOB_UPDATE", job: started });
+    await beginPolling(state.jobId);
+  } catch (error) {
+    dispatch({ type: "UPLOAD_FAILED", error: normalizeError(error) });
+  }
+}
+
 elements.uploadForm.addEventListener("submit", handleUpload);
 elements.videoInput.addEventListener("change", render);
 elements.dropZone.addEventListener("dragover", (event) => { event.preventDefault(); elements.dropZone.classList.add("dragging"); });
@@ -323,6 +449,20 @@ elements.dropZone.addEventListener("drop", (event) => {
 elements.guideTitle.addEventListener("input", (event) => dispatch({ type: "EDIT_TITLE", value: event.target.value }, true));
 elements.saveButton.addEventListener("click", handleSave);
 elements.addStepButton.addEventListener("click", () => dispatch({ type: "ADD_STEP" }));
+elements.annotationFrame.addEventListener("input", () => { selectedAnnotationPoint = null; renderAnnotation(); });
+elements.annotationName.addEventListener("input", renderAnnotation);
+elements.annotationImage.addEventListener("click", (event) => {
+  const bounds = elements.annotationImage.getBoundingClientRect();
+  selectedAnnotationPoint = {
+    x: (event.clientX - bounds.left) / bounds.width * elements.annotationImage.naturalWidth,
+    y: (event.clientY - bounds.top) / bounds.height * elements.annotationImage.naturalHeight,
+  };
+  renderAnnotation();
+});
+elements.addAnnotationButton.addEventListener("click", addAnnotation);
+elements.trackBackwardButton.addEventListener("click", trackBackward);
+elements.trackingFrame.addEventListener("input", renderTrackingPreview);
+elements.trackingImage.addEventListener("load", renderTrackingPreview);
 elements.resetButton.addEventListener("click", () => {
   pollController?.abort();
   history.replaceState({}, "", mockEnabled ? "?mock=1" : location.pathname);

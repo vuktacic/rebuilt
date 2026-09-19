@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 from .config import Settings
 from .errors import AppError
-from .models import AnalysisEvent, Frame, Guide, GuideStep, JobError
+from .models import AnalysisEvent, Frame, Guide, GuideStep, JobError, PartAnnotation
 from .storage import JobRepository
 from .vision import VisionAnalyzer
 
@@ -104,7 +104,7 @@ class FFmpegExtractor:
         output_dir.mkdir(parents=True, exist_ok=True)
         pattern = str(output_dir / "frame-%06d.jpg")
         scale = "scale='if(gt(iw,ih),1280,-2)':'if(gt(iw,ih),-2,1280)'"
-        command = [self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "-i", str(input_path), "-vf", f"fps={self.settings.analysis_fps},{scale}", "-q:v", "3", pattern]
+        command = [self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "1", "-i", str(input_path), "-vf", f"fps={self.settings.analysis_fps},{scale}", "-q:v", "3", pattern]
         try:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=self.settings.processing_timeout_seconds)
         except FileNotFoundError as exc:
@@ -160,39 +160,50 @@ class JobProcessor:
             if input_path is None:
                 raise AppError(422, "VIDEO_MISSING", "The uploaded video is missing.")
             extracted = self.extractor.extract(input_path, self.repository._job_dir(job_id) / "frames", job_id)
+            if hasattr(self.analyzer, "analyze_annotated"):
+                self.repository.update(job_id, status="annotating", frames=extracted.frames, error=None)
+                return
             self.repository.update(job_id, status="analyzing" if self.analyzer else "generating", frames=extracted.frames, error=None)
             if self.analyzer is not None:
                 result = self.analyzer.analyze(self.repository._job_dir(job_id) / "frames", len(extracted.frames), job_id)
                 self.repository.update(job_id, tracks=result.tracks, events=result.events, analysis=result.analysis, error=None)
                 if not result.events:
-                    raise AppError(422, "NO_EVENTS_DETECTED", "No reliable assembly or disassembly changes were detected.")
-                frame_ids = {frame.frameId for frame in extracted.frames}
-                referenced_ids = {frame_id for event in result.events for frame_id in (event.beforeFrameId, event.afterFrameId)}
-                if not referenced_ids.issubset(frame_ids):
-                    raise AppError(422, "INVALID_ANALYSIS", "Local analysis referenced a frame that was not extracted.")
-                self.repository.update(job_id, status="generating", error=None)
-                generated_guides: list[Guide] = []
-                for offset in range(0, len(result.events), 10):
-                    event_batch = result.events[offset:offset + 10]
-                    selected_ids = {event.beforeFrameId for event in event_batch} | {event.afterFrameId for event in event_batch}
-                    selected = [
-                        (frame, path)
-                        for frame, path in zip(extracted.frames, extracted.paths, strict=True)
-                        if frame.frameId in selected_ids
-                    ]
-                    frames_for_generation = [frame for frame, _ in selected]
-                    paths_for_generation = [path for _, path in selected]
-                    generated = validate_guide(
-                        self._generate_guide(frames_for_generation, paths_for_generation, event_batch),
-                        frames_for_generation,
+                    guide = Guide(
+                        title="Build needs review",
+                        steps=[GuideStep(
+                            text="No reliable physical change was detected automatically. Review the recording and replace this draft with the first verified build step.",
+                            frameId=extracted.frames[0].frameId,
+                            uncertainty="The local tracker could not maintain enough evidence for a confident change history.",
+                        )],
                     )
-                    if len(generated.steps) != len(event_batch):
-                        raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model did not return one step for each detected event.")
-                    generated_guides.append(generated)
-                guide = Guide(
-                    title=generated_guides[0].title,
-                    steps=[step for generated in generated_guides for step in generated.steps],
-                )
+                else:
+                    frame_ids = {frame.frameId for frame in extracted.frames}
+                    referenced_ids = {frame_id for event in result.events for frame_id in (event.beforeFrameId, event.afterFrameId)}
+                    if not referenced_ids.issubset(frame_ids):
+                        raise AppError(422, "INVALID_ANALYSIS", "Local analysis referenced a frame that was not extracted.")
+                    self.repository.update(job_id, status="generating", error=None)
+                    generated_guides: list[Guide] = []
+                    for offset in range(0, len(result.events), 10):
+                        event_batch = result.events[offset:offset + 10]
+                        selected_ids = {event.beforeFrameId for event in event_batch} | {event.afterFrameId for event in event_batch}
+                        selected = [
+                            (frame, path)
+                            for frame, path in zip(extracted.frames, extracted.paths, strict=True)
+                            if frame.frameId in selected_ids
+                        ]
+                        frames_for_generation = [frame for frame, _ in selected]
+                        paths_for_generation = [path for _, path in selected]
+                        generated = validate_guide(
+                            self._generate_guide(frames_for_generation, paths_for_generation, event_batch),
+                            frames_for_generation,
+                        )
+                        if len(generated.steps) != len(event_batch):
+                            raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model did not return one step for each detected event.")
+                        generated_guides.append(generated)
+                    guide = Guide(
+                        title=generated_guides[0].title,
+                        steps=[step for generated in generated_guides for step in generated.steps],
+                    )
             else:
                 guide = validate_guide(
                     self._generate_guide(extracted.frames, extracted.paths, None),
@@ -203,6 +214,72 @@ class JobProcessor:
             self.repository.update(job_id, status="failed", error=JobError(code=exc.code, message=exc.message))
         except Exception:
             self.repository.update(job_id, status="failed", error=JobError(code="PROCESSING_FAILED", message="The video could not be processed."))
+
+    def track_annotated(self, job_id: str, annotations: list[PartAnnotation]) -> None:
+        """Resume an extracted job after its named final-frame prompts are saved."""
+        try:
+            job = self.repository.get(job_id)
+            if job is None:
+                return
+            if job.status != "annotating":
+                raise AppError(409, "ANNOTATION_NOT_READY", "This video is not waiting for annotations.")
+            analyzer = self.analyzer
+            if analyzer is None or not hasattr(analyzer, "analyze_annotated"):
+                raise AppError(409, "ANNOTATION_UNSUPPORTED", "The configured vision backend does not support manual backward tracking.")
+            frame_dir = self.repository._job_dir(job_id) / "frames"
+            frame_paths = [frame_dir / f"{frame.frameId}.jpg" for frame in job.frames]
+            self.repository.update(job_id, status="analyzing", annotations=annotations, tracking_progress=0, error=None)
+            result = analyzer.analyze_annotated(
+                frame_dir,
+                len(job.frames),
+                job_id,
+                annotations,
+                on_progress=lambda value: self.repository.update(job_id, tracking_progress=value, error=None),
+            )
+            self.repository.update(
+                job_id,
+                tracks=result.tracks,
+                part_tracks=result.part_tracks or [],
+                events=result.events,
+                analysis=result.analysis,
+                error=None,
+            )
+            self._finish_guide(job_id, job.frames, frame_paths, result.events)
+        except AppError as exc:
+            self.repository.update(job_id, status="failed", error=JobError(code=exc.code, message=exc.message))
+        except Exception:
+            self.repository.update(job_id, status="failed", error=JobError(code="PROCESSING_FAILED", message="Backward tracking could not be completed."))
+
+    def _finish_guide(self, job_id: str, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent]) -> None:
+        if not events:
+            guide = Guide(
+                title="Build needs review",
+                steps=[GuideStep(
+                    text="No reliable attachment interval was inferred. Review the reverse-track overlay and add the first verified build step.",
+                    frameId=frames[0].frameId,
+                    uncertainty="The local reverse tracker did not find a confident attachment transition.",
+                )],
+            )
+        else:
+            frame_ids = {frame.frameId for frame in frames}
+            referenced_ids = {frame_id for event in events for frame_id in (event.beforeFrameId, event.afterFrameId)}
+            if not referenced_ids.issubset(frame_ids):
+                raise AppError(422, "INVALID_ANALYSIS", "Local analysis referenced a frame that was not extracted.")
+            self.repository.update(job_id, status="generating", error=None)
+            generated_guides: list[Guide] = []
+            for offset in range(0, len(events), 10):
+                event_batch = events[offset:offset + 10]
+                selected_ids = {event.beforeFrameId for event in event_batch} | {event.afterFrameId for event in event_batch}
+                selected = [(frame, path) for frame, path in zip(frames, paths, strict=True) if frame.frameId in selected_ids]
+                generated = validate_guide(
+                    self._generate_guide([frame for frame, _ in selected], [path for _, path in selected], event_batch),
+                    [frame for frame, _ in selected],
+                )
+                if len(generated.steps) != len(event_batch):
+                    raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model did not return one step for each detected event.")
+                generated_guides.append(generated)
+            guide = Guide(title=generated_guides[0].title, steps=[step for generated in generated_guides for step in generated.steps])
+        self.repository.update(job_id, status="ready", guide=guide, error=None)
 
     def _generate_guide(self, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent] | None) -> Guide:
         if events is not None:

@@ -76,12 +76,43 @@ about 12.5 minutes for a 15.9-second clip. This keeps the 0.9B model usable on
 the target laptop while requiring two stable observations around a change.
 Set `REBUILT_ANALYSIS_FPS=10` for a slower high-detail pass.
 
-To verify local segmentation and event extraction without calling OpenAI, run:
+To verify CUDA local segmentation and event extraction without calling OpenAI, run:
 
 ```bash
-python scripts/benchmark_sam3.py testdata/IMG_3320.MOV
+python scripts/benchmark_sam3.py testdata/IMG_3320.MOV --output reports/IMG_3320.sam3-cuda.json
 ```
 
-Set `REBUILT_VISION_BACKEND=noop` only for local API/contract work without a
-CUDA model. Keep the token file out of source control; it is already ignored by
-the repository.
+### Apple Silicon macOS
+
+On a native arm64 Mac (not Rosetta), bootstrap the isolated MLX environment and
+pinned MXFP4 SAM3 snapshot, then launch the MLX runtime:
+
+```bash
+./scripts/bootstrap_mlx_sam3.sh
+./scripts/run_backend_mlx.sh
+```
+
+`REBUILT_VISION_BACKEND=auto` resolves to `sam3-mlx` on native Apple Silicon
+and to the existing CUDA runtime on supported CUDA hosts. Use explicit
+`sam3-mlx` or `sam3-cuda` to override auto-detection; an unsupported selection
+keeps `/health` live but rejects `/jobs` with a diagnostic. Run the
+credential-free fixture report with:
+
+```bash
+unset PYTHONPATH
+REBUILT_VISION_BACKEND=sam3-mlx .venv-mlx-sam3/bin/python \
+  scripts/generate_fixture_report.py testdata/IMG_3320.MOV \
+  --output reports/IMG_3320.sam3-mlx.json
+```
+
+The report has sanitized model/runtime provenance plus analysis, tracks, and
+events; it never includes guide credentials or environment values. Set
+`REBUILT_VISION_BACKEND=noop` only for local API/contract work without a model.
+Keep the token file out of source control; it is already ignored by the
+repository.
+
+The MLX path defaults to a fast profile: SAM3 receives 336px inputs and checks
+every other extracted frame. This keeps a fixed-camera demo responsive while
+preserving the source frame IDs used for evidence. Set `MLX_SAM3_IMAGE_SIZE`
+or `MLX_SAM3_FRAME_STRIDE=1` for a higher-detail pass; expect that to increase
+local analysis time materially.
