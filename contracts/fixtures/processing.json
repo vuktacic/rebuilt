@@ -2,6 +2,9 @@
   "jobId": "job-processing",
   "status": "extracting",
   "frames": [],
+  "tracks": [],
+  "events": [],
+  "analysis": null,
   "guide": null,
   "error": null
 }

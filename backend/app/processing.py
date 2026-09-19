@@ -12,17 +12,20 @@ from typing import Any, Protocol
 
 from .config import Settings
 from .errors import AppError
-from .models import Frame, Guide, GuideStep, JobError
+from .models import AnalysisEvent, Frame, Guide, GuideStep, JobError
 from .storage import JobRepository
+from .vision import VisionAnalyzer
 
 
 class GuideGenerator(Protocol):
-    def generate(self, frames: list[Frame], frame_paths: list[Path]) -> Guide: ...
+    def generate(self, frames: list[Frame], frame_paths: list[Path], events: list[AnalysisEvent] | None = None) -> Guide: ...
 
 
 PROMPT = """You turn ordered frames from a fixed-camera LEGO build video into a concise assembly guide.
 Describe only visible assembly changes, use a clear completed-state frame for each step when possible,
-and mention uncertainty when a hand or occlusion hides placement. Return one step per meaningful change.
+and mention uncertainty when a hand or occlusion hides placement. Local analysis labels each pair BEFORE
+and AFTER; describe additions for attach events and removals for detach events. Return exactly one
+step per supplied event, in event order, without merging separate events.
 Every frameId must be copied exactly from the supplied frame list. Do not invent pieces or frame IDs.
 """
 
@@ -31,13 +34,27 @@ class OpenAIResponsesGenerator:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    def generate(self, frames: list[Frame], frame_paths: list[Path]) -> Guide:
+    def generate(self, frames: list[Frame], frame_paths: list[Path], events: list[AnalysisEvent] | None = None) -> Guide:
         if not self.settings.openai_api_key:
             raise AppError(500, "OPENAI_NOT_CONFIGURED", "OPENAI_API_KEY is not configured.")
         content: list[dict[str, Any]] = [{"type": "input_text", "text": PROMPT}]
+        if events:
+            event_lines = [
+                f"Event {event.eventId}: {event.kind} from {event.startTimestampSeconds:.1f}s to {event.endTimestampSeconds:.1f}s; "
+                f"BEFORE={event.beforeFrameId}; AFTER={event.afterFrameId}; evidence={event.evidence}; uncertainty={event.uncertainty or 'none'}"
+                for event in events[:10]
+            ]
+            content.append({"type": "input_text", "text": "Analyze these local event pairs in order:\n" + "\n".join(event_lines)})
         for frame, path in zip(frames, frame_paths, strict=True):
             encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-            content.append({"type": "input_text", "text": f"Frame {frame.frameId} at {frame.timestampSeconds:.1f}s"})
+            roles = [
+                role
+                for event in events or []
+                for role, frame_id in (("BEFORE", event.beforeFrameId), ("AFTER", event.afterFrameId))
+                if frame_id == frame.frameId
+            ]
+            label = "/".join(dict.fromkeys(roles)) or "EVENT"
+            content.append({"type": "input_text", "text": f"{label} frame {frame.frameId} at {frame.timestampSeconds:.1f}s"})
             content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{encoded}"})
         payload = {
             "model": self.settings.model,
@@ -84,7 +101,7 @@ class FFmpegExtractor:
         output_dir.mkdir(parents=True, exist_ok=True)
         pattern = str(output_dir / "frame-%06d.jpg")
         scale = "scale='if(gt(iw,ih),1280,-2)':'if(gt(iw,ih),-2,1280)'"
-        command = [self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "-i", str(input_path), "-vf", f"fps=1,{scale}", "-q:v", "3", pattern]
+        command = [self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "-i", str(input_path), "-vf", f"fps={self.settings.analysis_fps},{scale}", "-q:v", "3", pattern]
         try:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=self.settings.processing_timeout_seconds)
         except FileNotFoundError as exc:
@@ -97,7 +114,7 @@ class FFmpegExtractor:
         paths = sorted(output_dir.glob("frame-*.jpg"))
         if not paths:
             raise AppError(422, "VIDEO_EMPTY", "The video did not contain any decodable frames.")
-        frames = [Frame(frameId=f"frame-{index:04d}", timestampSeconds=float(index), imageUrl=f"/jobs/{job_id}/frames/frame-{index:04d}") for index in range(len(paths))]
+        frames = [Frame(frameId=f"frame-{index:04d}", timestampSeconds=index / self.settings.analysis_fps, imageUrl=f"/jobs/{job_id}/frames/frame-{index:04d}") for index in range(len(paths))]
         for index, path in enumerate(paths):
             target = output_dir / f"frame-{index:04d}.jpg"
             path.rename(target)
@@ -117,10 +134,18 @@ def validate_guide(guide: Guide, frames: list[Frame]) -> Guide:
 
 
 class JobProcessor:
-    def __init__(self, repository: JobRepository, settings: Settings, extractor: FFmpegExtractor | None = None, generator: GuideGenerator | None = None):
+    def __init__(
+        self,
+        repository: JobRepository,
+        settings: Settings,
+        extractor: FFmpegExtractor | None = None,
+        generator: GuideGenerator | None = None,
+        analyzer: VisionAnalyzer | None = None,
+    ):
         self.repository = repository
         self.extractor = extractor or FFmpegExtractor(settings)
         self.generator = generator or OpenAIResponsesGenerator(settings)
+        self.analyzer = analyzer
 
     def process(self, job_id: str) -> None:
         try:
@@ -132,10 +157,55 @@ class JobProcessor:
             if input_path is None:
                 raise AppError(422, "VIDEO_MISSING", "The uploaded video is missing.")
             extracted = self.extractor.extract(input_path, self.repository._job_dir(job_id) / "frames", job_id)
-            self.repository.update(job_id, status="generating", frames=extracted.frames, error=None)
-            guide = validate_guide(self.generator.generate(extracted.frames, extracted.paths), extracted.frames)
-            self.repository.update(job_id, status="ready", frames=extracted.frames, guide=guide, error=None)
+            self.repository.update(job_id, status="analyzing" if self.analyzer else "generating", frames=extracted.frames, error=None)
+            if self.analyzer is not None:
+                result = self.analyzer.analyze(self.repository._job_dir(job_id) / "frames", len(extracted.frames), job_id)
+                self.repository.update(job_id, tracks=result.tracks, events=result.events, analysis=result.analysis, error=None)
+                if not result.events:
+                    raise AppError(422, "NO_EVENTS_DETECTED", "No reliable assembly or disassembly changes were detected.")
+                frame_ids = {frame.frameId for frame in extracted.frames}
+                referenced_ids = {frame_id for event in result.events for frame_id in (event.beforeFrameId, event.afterFrameId)}
+                if not referenced_ids.issubset(frame_ids):
+                    raise AppError(422, "INVALID_ANALYSIS", "Local analysis referenced a frame that was not extracted.")
+                self.repository.update(job_id, status="generating", error=None)
+                generated_guides: list[Guide] = []
+                for offset in range(0, len(result.events), 10):
+                    event_batch = result.events[offset:offset + 10]
+                    selected_ids = {event.beforeFrameId for event in event_batch} | {event.afterFrameId for event in event_batch}
+                    selected = [
+                        (frame, path)
+                        for frame, path in zip(extracted.frames, extracted.paths, strict=True)
+                        if frame.frameId in selected_ids
+                    ]
+                    frames_for_generation = [frame for frame, _ in selected]
+                    paths_for_generation = [path for _, path in selected]
+                    generated = validate_guide(
+                        self._generate_guide(frames_for_generation, paths_for_generation, event_batch),
+                        frames_for_generation,
+                    )
+                    if len(generated.steps) != len(event_batch):
+                        raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model did not return one step for each detected event.")
+                    generated_guides.append(generated)
+                guide = Guide(
+                    title=generated_guides[0].title,
+                    steps=[step for generated in generated_guides for step in generated.steps],
+                )
+            else:
+                guide = validate_guide(
+                    self._generate_guide(extracted.frames, extracted.paths, None),
+                    extracted.frames,
+                )
+            self.repository.update(job_id, status="ready", guide=guide, error=None)
         except AppError as exc:
             self.repository.update(job_id, status="failed", error=JobError(code=exc.code, message=exc.message))
         except Exception:
             self.repository.update(job_id, status="failed", error=JobError(code="PROCESSING_FAILED", message="The video could not be processed."))
+
+    def _generate_guide(self, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent] | None) -> Guide:
+        if events is not None:
+            try:
+                return self.generator.generate(frames, paths, events=events)
+            except TypeError as exc:
+                if "events" not in str(exc):
+                    raise
+        return self.generator.generate(frames, paths)

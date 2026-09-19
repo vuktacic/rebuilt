@@ -5,6 +5,9 @@
     {"frameId": "frame-0001", "timestampSeconds": 0, "imageUrl": "/jobs/job-ready/frames/frame-0001"},
     {"frameId": "frame-0002", "timestampSeconds": 1, "imageUrl": "/jobs/job-ready/frames/frame-0002"}
   ],
+  "tracks": [],
+  "events": [],
+  "analysis": null,
   "guide": {
     "title": "Small brick model",
     "steps": [

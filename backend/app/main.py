@@ -16,6 +16,7 @@ from .errors import AppError, error_payload
 from .models import Guide, JobCreated, JobResponse
 from .processing import JobProcessor, validate_guide
 from .storage import ACTIVE_STATUSES, JobRepository
+from .vision import NoopVisionAnalyzer, Sam3VisionAnalyzer
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".webm"}
@@ -54,7 +55,11 @@ class JobCoordinator:
 def create_app(settings: Settings | None = None, *, processor: JobProcessor | None = None) -> FastAPI:
     resolved = settings or Settings.from_env()
     repository = JobRepository(resolved.data_dir)
-    job_processor = processor or JobProcessor(repository, resolved)
+    if processor is None:
+        analyzer = NoopVisionAnalyzer() if resolved.vision_backend == "noop" else Sam3VisionAnalyzer(resolved)
+        job_processor = JobProcessor(repository, resolved, analyzer=analyzer)
+    else:
+        job_processor = processor
     coordinator = JobCoordinator(repository, job_processor)
 
     app = FastAPI(title="Rebuilt", version="0.1.0")

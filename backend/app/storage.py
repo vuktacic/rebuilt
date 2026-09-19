@@ -6,10 +6,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import Frame, Guide, JobError, JobResponse, JobStatus
+from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobResponse, JobStatus, TrackSummary
 
 
-ACTIVE_STATUSES = {"queued", "extracting", "generating"}
+ACTIVE_STATUSES = {"queued", "extracting", "analyzing", "generating"}
 
 
 class JobRepository:
@@ -47,8 +47,18 @@ class JobRepository:
             raw = json.loads(path.read_text(encoding="utf-8"))
         return JobResponse.model_validate(raw)
 
-    def update(self, job_id: str, *, status: JobStatus | None = None, frames: list[Frame] | None = None,
-               guide: Guide | None = None, error: JobError | None = None) -> JobResponse:
+    def update(
+        self,
+        job_id: str,
+        *,
+        status: JobStatus | None = None,
+        frames: list[Frame] | None = None,
+        tracks: list[TrackSummary] | None = None,
+        events: list[AnalysisEvent] | None = None,
+        analysis: AnalysisInfo | None = None,
+        guide: Guide | None = None,
+        error: JobError | None = None,
+    ) -> JobResponse:
         current = self.get(job_id)
         if current is None:
             raise KeyError(job_id)
@@ -56,6 +66,9 @@ class JobRepository:
             update={
                 "status": status if status is not None else current.status,
                 "frames": frames if frames is not None else current.frames,
+                "tracks": tracks if tracks is not None else current.tracks,
+                "events": events if events is not None else current.events,
+                "analysis": analysis if analysis is not None else current.analysis,
                 "guide": guide if guide is not None else current.guide,
                 "error": error,
             }

@@ -3,11 +3,14 @@
   "$id": "https://rebuilt.local/contracts/job.schema.json",
   "title": "Job",
   "type": "object",
-  "required": ["jobId", "status", "frames", "guide", "error"],
+  "required": ["jobId", "status", "frames", "tracks", "events", "analysis", "guide", "error"],
   "properties": {
     "jobId": {"type": "string", "minLength": 1},
-    "status": {"enum": ["queued", "extracting", "generating", "ready", "failed"]},
+    "status": {"enum": ["queued", "extracting", "analyzing", "generating", "ready", "failed"]},
     "frames": {"type": "array", "items": {"$ref": "#/$defs/frame"}},
+    "tracks": {"type": "array", "items": {"$ref": "#/$defs/track"}},
+    "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+    "analysis": {"anyOf": [{"$ref": "#/$defs/analysis"}, {"type": "null"}]},
     "guide": {"anyOf": [{"$ref": "#/$defs/guide"}, {"type": "null"}]},
     "error": {"anyOf": [{"$ref": "#/$defs/error"}, {"type": "null"}]}
   },
@@ -19,6 +22,48 @@
         "frameId": {"type": "string", "minLength": 1},
         "timestampSeconds": {"type": "number", "minimum": 0},
         "imageUrl": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "track": {
+      "type": "object",
+      "required": ["trackId", "concept", "firstTimestampSeconds", "lastTimestampSeconds", "visibility", "membership"],
+      "properties": {
+        "trackId": {"type": "string", "minLength": 1},
+        "concept": {"type": "string", "minLength": 1},
+        "firstTimestampSeconds": {"type": "number", "minimum": 0},
+        "lastTimestampSeconds": {"type": "number", "minimum": 0},
+        "visibility": {"enum": ["visible", "occluded", "lost"]},
+        "membership": {"enum": ["separate", "attached", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["eventId", "kind", "startTimestampSeconds", "endTimestampSeconds", "affectedTrackIds", "beforeFrameId", "afterFrameId", "evidenceStrength", "uncertainty", "evidence"],
+      "properties": {
+        "eventId": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["attach", "detach", "uncertain_change"]},
+        "startTimestampSeconds": {"type": "number", "minimum": 0},
+        "endTimestampSeconds": {"type": "number", "minimum": 0},
+        "affectedTrackIds": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "beforeFrameId": {"type": "string", "minLength": 1},
+        "afterFrameId": {"type": "string", "minLength": 1},
+        "evidenceStrength": {"type": "number", "minimum": 0, "maximum": 1},
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "evidence": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["backend", "modelVersion", "configVersion", "durationSeconds", "metrics"],
+      "properties": {
+        "backend": {"type": "string", "minLength": 1},
+        "modelVersion": {"type": "string", "minLength": 1},
+        "configVersion": {"type": "string", "minLength": 1},
+        "durationSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "metrics": {"type": "object", "additionalProperties": {"type": "number"}}
       },
       "additionalProperties": false
     },

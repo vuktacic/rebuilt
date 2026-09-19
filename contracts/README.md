@@ -6,9 +6,12 @@ multipart field named `video` and returns `202 {"jobId":"..."}`. Clients poll
 and supplied frame URLs. A complete guide can be saved with
 `PUT /jobs/{jobId}/guide`.
 
-`status` is one of `queued`, `extracting`, `generating`, `ready`, or `failed`.
-Frame IDs are stable for the lifetime of a job. A guide step must reference an
-existing frame and contain non-empty text. Error responses use
+`status` is one of `queued`, `extracting`, `analyzing`, `generating`, `ready`,
+or `failed`. During analysis, `tracks` and `events` are populated when local
+SAM3 finds stable attachment or detachment evidence. Each event references a
+stable before/after frame pair and may carry an uncertainty reason. Frame IDs
+are stable for the lifetime of a job. A guide step must reference an existing
+selected frame and contain non-empty text. Error responses use
 `{"error":{"code":"...","message":"..."}}`.
 
 The machine-readable schema is in [`job.schema.json`](job.schema.json). The

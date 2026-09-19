@@ -4,3 +4,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+private
+.venv-sam3/
+.models/
+.third_party/
+.artifacts/
