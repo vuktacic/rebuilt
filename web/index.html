@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Turn a LEGO build recording into editable illustrated instructions." />
+    <title>Rebuilt — video to instructions</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="/" aria-label="Rebuilt home"><span class="wordmark-mark">R</span> rebuilt</a>
+      <div class="header-note">From a build video to a guide you can trust.</div>
+    </header>
+
+    <main class="shell">
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">LEGO build assistant</p>
+        <h1 id="page-title">Make the build clear<br /><em>one frame at a time.</em></h1>
+        <p class="lede">Upload a short, fixed-camera recording. Rebuilt finds the meaningful assembly changes and gives you an editable guide to review.</p>
+      </section>
+
+      <div id="mode-banner" class="mode-banner" hidden></div>
+
+      <section class="workspace" aria-label="Build guide workspace">
+        <section class="upload-panel panel" aria-labelledby="upload-heading">
+          <div class="panel-kicker"><span class="step-dot">01</span><span>Start with a recording</span></div>
+          <h2 id="upload-heading">What did you build?</h2>
+          <p class="panel-copy">Use a phone video up to 90 seconds. Keep the camera still and pause with your hands out of the way when you can.</p>
+          <form id="upload-form">
+            <label id="drop-zone" class="drop-zone" for="video-input">
+              <input id="video-input" type="file" name="video" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv" />
+              <span class="drop-icon" aria-hidden="true">↑</span>
+              <span class="drop-title">Choose a video</span>
+              <span class="drop-hint">MP4, MOV, WebM or MKV · up to 250 MB</span>
+              <span id="selected-file" class="selected-file" hidden></span>
+            </label>
+            <button id="upload-button" class="button button-primary" type="submit" disabled>Analyze video <span aria-hidden="true">→</span></button>
+          </form>
+        </section>
+
+        <section class="status-panel panel" aria-labelledby="status-heading" aria-live="polite">
+          <div class="panel-kicker"><span class="step-dot">02</span><span>Follow along</span></div>
+          <div class="status-heading-row">
+            <h2 id="status-heading">Processing status</h2>
+            <span id="status-pill" class="status-pill">Waiting</span>
+          </div>
+          <p id="status-message" class="status-message">Choose a recording to begin</p>
+          <div class="progress-track" aria-hidden="true"><span id="progress-bar"></span></div>
+          <p id="status-detail" class="status-detail">Your original video stays on this device while it uploads.</p>
+          <div id="error-box" class="error-box" role="alert" hidden></div>
+        </section>
+      </section>
+
+      <section id="guide-panel" class="guide-panel panel" aria-labelledby="guide-heading" hidden>
+        <div class="guide-topline">
+          <div class="panel-kicker"><span class="step-dot">03</span><span>Review and save</span></div>
+          <span id="dirty-label" class="dirty-label" hidden>Unsaved changes</span>
+        </div>
+        <div class="guide-heading-row">
+          <div>
+            <h2 id="guide-heading">Your assembly guide</h2>
+            <p class="panel-copy">Read through each change, adjust the wording, and choose the clearest frame.</p>
+          </div>
+          <button id="save-button" class="button button-primary" type="button">Save guide <span aria-hidden="true">✓</span></button>
+        </div>
+        <div id="save-error" class="error-box" role="alert" hidden></div>
+        <label class="title-field" for="guide-title">Guide title<input id="guide-title" data-field="title" type="text" autocomplete="off" /></label>
+        <div id="steps-list" class="steps-list"></div>
+        <button id="add-step-button" class="button button-secondary add-step" type="button"><span aria-hidden="true">＋</span> Add a step</button>
+      </section>
+
+      <div class="footer-actions"><button id="reset-button" class="text-button" type="button">Start another build</button></div>
+    </main>
+
+    <footer class="site-footer"><span>Rebuilt MVP</span><span>Review every guide before building from it.</span></footer>
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>
