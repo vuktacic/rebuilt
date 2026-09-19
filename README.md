@@ -6,12 +6,36 @@ backend and the shared API contract in `contracts/`.
 
 ## Run the backend
 
+Create the local environment file once, then put your OpenAI key in it. The
+file is ignored and the application reads simple `KEY=value` entries without
+executing shell content. Existing process environment variables take priority.
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export OPENAI_API_KEY=your-key
-uvicorn backend.app.main:app --reload
+cp .env.example .env
+chmod 600 .env
+${EDITOR:-vi} .env
+```
+
+Set `OPENAI_API_KEY` in `.env`. Keep the Hugging Face token in
+`private/.hf_token`; it is loaded separately and never written to job output.
+
+After the SAM3 bootstrap below, start the local server with:
+
+```bash
+./scripts/run_backend.sh
+```
+
+Use `REBUILT_HOST=0.0.0.0` if the browser is outside WSL, or change
+`REBUILT_PORT` when port 8000 is occupied.
+
+For a UI-only walkthrough without a model or API key, open the server with
+`?mock=1` appended to the URL. Mock mode never substitutes for live failures.
+
+The manual equivalent remains available:
+
+```bash
+source .venv-sam3/bin/activate
+uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
 The server stores uploads and generated frames under `.data/` by default. Set

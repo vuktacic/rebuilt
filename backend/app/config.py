@@ -1,8 +1,40 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """Read simple KEY=value entries without evaluating the file as code."""
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not _ENV_KEY.fullmatch(key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _load_dotenv(path: Path, environ: dict[str, str] | None = None) -> None:
+    target = os.environ if environ is None else environ
+    for key, value in _read_dotenv(path).items():
+        target.setdefault(key, value)
 
 
 @dataclass(frozen=True)
@@ -32,6 +64,11 @@ class Settings:
     @classmethod
     def from_env(cls, data_dir: Path | None = None) -> "Settings":
         project_root = Path(__file__).resolve().parents[2]
+        configured_env_file = os.getenv("REBUILT_ENV_FILE")
+        env_file = Path(configured_env_file) if configured_env_file else project_root / ".env"
+        if not env_file.is_absolute():
+            env_file = project_root / env_file
+        _load_dotenv(env_file)
         precision = os.getenv("SAM3_PRECISION", "bf16").lower()
         checkpoint_name = "sam3-bf16.pt" if precision == "bf16" else "sam3.pt"
         local_checkpoint = project_root / ".models" / "sam3" / checkpoint_name

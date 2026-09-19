@@ -10,3 +10,6 @@ private
 .models/
 .third_party/
 .artifacts/
+.env
+.env.*
+!.env.example
