@@ -1,0 +1,3 @@
+{
+  "error": {"code": "INVALID_GUIDE", "message": "Each step must contain non-empty text and reference an extracted frame."}
+}
