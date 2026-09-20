@@ -1,0 +1,2 @@
+# Optional provider runtime. The core and plan-3 baseline do not require it.
+google-genai==2.24.0

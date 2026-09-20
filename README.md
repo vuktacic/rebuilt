@@ -18,6 +18,21 @@ ${EDITOR:-vi} .env
 
 Set `OPENAI_API_KEY` in `.env`. Keep the Hugging Face token in
 `private/.hf_token`; it is loaded separately and never written to job output.
+Gemini accepts `GEMINI_API_KEY` from the environment or `.env`; when that value
+is empty, it reads the raw key from `GEMINI_API_KEY_FILE`, which defaults to
+`private/.gemini_token`. Keep either credential file at mode `600`.
+
+For the CUDA-backed SAM2 server, provision the environment, including the
+optional Gemini SDK, and start the API and browser UI with one command:
+
+```bash
+./scripts/setup_server.sh
+```
+
+Use `./scripts/setup_server.sh --setup-only` to provision and validate without
+starting the server. Set `INSTALL_GEMINI=0` if only the baseline/GPT runtime is
+needed; the separate `scripts/bootstrap_gemini.sh` remains available for an
+isolated Gemini environment.
 
 After the SAM3 bootstrap below, start the local server with:
 
@@ -40,8 +55,22 @@ uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 
 The server stores uploads and generated frames under `.data/` by default. Set
 `REBUILT_DATA_DIR` to use a separate runtime directory. `OPENAI_MODEL` defaults
-to `gpt-5.4`; credentials remain server-side. The API is documented in
+to `gpt-5.4`; the browser defaults to manual snapshots with
+`MANUAL_COMPARE_MODEL=gpt-6-astra` and `MANUAL_WRITER_MODEL=gpt-5.6-luna`.
+Credentials remain server-side. The API is documented in
 [`contracts/README.md`](contracts/README.md).
+
+The manual snapshot workflow extracts orientation-corrected frames at 5 FPS.
+Choose the initial state and one settled state after each visible action, save
+the storyboard, review each adjacent-pair finding, and explicitly include or
+skip every pair before writing the editable guide. It does not use SAM2,
+Gemini, automatic event detection, or automated guide verification.
+
+Manual SAM2 jobs show replaceable piece-name and point suggestions after frame
+extraction. Review and accept them before tracking. After the guide is drafted,
+the browser can send the selected guide and bounded evidence frames to OpenAI
+for an image-backed verification pass; corrections remain reviewable and user
+edits invalidate an earlier verification.
 
 For a quick request, upload a supported video as the `video` multipart field:
 
@@ -117,7 +146,7 @@ preserving the source frame IDs used for evidence. Set `MLX_SAM3_IMAGE_SIZE`
 or `MLX_SAM3_FRAME_STRIDE=1` for a higher-detail pass; expect that to increase
 local analysis time materially.
 
-### Fast manual SAM2 reverse tracking on Apple Silicon
+### Fast manual SAM2 reverse tracking on CUDA or Apple Silicon
 
 The default `sam2` backend now uses a fast temporal profile: it propagates
 every other extracted frame, always includes saved annotation frames and the
@@ -125,6 +154,24 @@ final frame, then restores source-frame IDs in the review track. This reduces
 the default model work by about half while keeping the UI and guide references
 in original video coordinates. Set `SAM2_FRAME_STRIDE=1` for maximum temporal
 detail.
+
+On a CUDA host, the standard SAM2 runtime uses the installed PyTorch CUDA build.
+Bootstrap it, then start the same-origin API and browser UI together:
+
+```bash
+./scripts/bootstrap_sam2.sh
+REBUILT_VISION_BACKEND=sam2 ./scripts/run_backend_sam2.sh
+```
+
+The bootstrap installs a CUDA PyTorch build on Linux when the default CUDA
+index is used and keeps large installer temporary files under
+`.third_party/sam2-tmp`; set `PYTORCH_INDEX_URL` or `SAM2_TMP_DIR` to override
+either choice.
+
+Open `http://127.0.0.1:8000/`, upload the recording, label its clearly separated
+parts on the final frame, and select **Track backward**. The default stride of
+two analyzes a 2 FPS extraction at one SAM2 inference frame per second; increase
+`SAM2_FRAME_STRIDE` only after checking the warm-run timing on the demo GPU.
 
 For a native MLX implementation of the same manual backward-tracking workflow,
 use the separate pinned runtime:

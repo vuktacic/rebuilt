@@ -59,15 +59,23 @@ test("live HTTP errors stay errors instead of silently entering mock mode", asyn
   });
 });
 
-test("mock mode simulates progress and persists a successful save", async () => {
+test("mock mode simulates the manual snapshot workflow and persists a successful save", async () => {
   const storage = new MapStorage();
   const client = createApiClient({ mock: true, storage });
   const { jobId } = await client.uploadVideo(new File(["x"], "build.mp4"));
-  const final = await client.pollJob(jobId, { intervalMs: 0 });
+  const extracted = await client.pollJob(jobId, { intervalMs: 0 });
+  assert.equal(extracted.status, "annotating");
+  const storyboardJob = await client.saveStoryboard(jobId, extracted.frames.map((frame) => frame.frameId), "mock parts");
+  const reviewed = {
+    ...storyboardJob.storyboard,
+    pairs: storyboardJob.storyboard.pairs.map((pair) => ({ ...pair, disposition: "include" })),
+  };
+  const savedReview = await client.saveDifferences(jobId, reviewed);
+  const final = await client.generateGuide(jobId, savedReview.storyboard.revision);
   assert.equal(final.status, "ready");
   assert.equal(final.frames.length, 2);
   const saved = await client.saveGuide(jobId, final.guide);
-  assert.equal(saved.title, "Small brick model");
+  assert.equal(saved.title, "Mock snapshot guide");
   assert.ok(storage.getItem(`rebuilt:mock:${jobId}`));
 });
 

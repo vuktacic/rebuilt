@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { initialState, reduce, statusMessage, validateDraft } from "../src/state.js";
+import { attachmentTargetName, initialState, reduce, statusMessage, validateDraft } from "../src/state.js";
 
 const frames = [
   { frameId: "frame-0001", timestampSeconds: 0, imageUrl: "/one.jpg" },
@@ -52,18 +52,46 @@ test("draft validation catches empty instructions and unknown frames", () => {
   assert.equal(validateDraft(guide, frames), null);
 });
 
+test("attachment target names are resolved from ordered affected track ids", () => {
+  const tracks = [{ partId: 1, name: "red roof" }, { partId: 2, name: "blue base" }];
+  const events = [{ kind: "attach", affectedTrackIds: ["part:1", "part:2"] }];
+
+  assert.equal(attachmentTargetName(tracks[0], events, tracks), "blue base");
+  assert.equal(attachmentTargetName(tracks[1], events, tracks), null);
+});
+
 test("status messages distinguish processing and unsaved review", () => {
   let state = reduce(initialState(), { type: "UPLOAD_STARTED", name: "build.mp4" });
   assert.equal(statusMessage(state), "Uploading your recording…");
   state = reduce(state, { type: "UPLOAD_ACCEPTED", jobId: "job-1" });
   state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "annotating", frames, events: [], guide: null, error: null } });
-  assert.equal(statusMessage(state), "Name visible parts on the final frame…");
+  assert.equal(statusMessage(state), "Review snapshots and pair differences…");
   state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "analyzing", frames, events: [{ eventId: "event-1" }], guide: null, error: null } });
-  assert.equal(statusMessage(state), "Tracking named parts backward through the video…");
+  assert.equal(statusMessage(state), "Reconstructing the source-order action timeline…");
   assert.equal(state.events.length, 1);
   state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "generating", frames, guide: null, error: null } });
   assert.equal(statusMessage(state), "Writing the assembly guide…");
   state = reduce(state, { type: "JOB_UPDATE", job: { jobId: "job-1", status: "ready", frames, guide, error: null } });
   state = reduce(state, { type: "EDIT_TITLE", value: "Changed" });
   assert.equal(statusMessage(state), "Unsaved edits");
+});
+
+test("piece edits preserve stable ids and guide edits mark verification stale", () => {
+  let state = reduce(initialState(), { type: "LOAD_JOB", job: {
+    jobId: "job-2",
+    status: "annotating",
+    frames,
+    annotations: [{ partId: 7, name: "red brick", frameIndex: 1, points: [{ x: 4, y: 5 }], labels: [1] }],
+    annotationSuggestions: { status: "completed", frameIndex: 1, suggestions: [{ partId: 8, name: "blue plate", frameIndex: 1, point: { x: 10, y: 10 }, confidence: 0.9 }] },
+    guide: guide,
+    verification: { status: "completed", revision: 1, coverage: 1, findings: [], proposedChanges: [] },
+    guideRevision: 1,
+    error: null,
+  } });
+  state = reduce(state, { type: "EDIT_ANNOTATION_NAME", partId: 7, value: "renamed brick" });
+  assert.equal(state.annotations[0].partId, 7);
+  state = reduce(state, { type: "ACCEPT_SUGGESTIONS" });
+  assert.deepEqual(state.annotations.map((item) => item.partId), [7, 8]);
+  state = reduce(state, { type: "EDIT_STEP_TEXT", index: 0, value: "Move it." });
+  assert.equal(state.verification.status, "stale");
 });

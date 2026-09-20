@@ -6,13 +6,25 @@
   "required": ["jobId", "status", "frames", "tracks", "events", "analysis", "guide", "error"],
   "properties": {
     "jobId": {"type": "string", "minLength": 1},
-    "status": {"enum": ["queued", "extracting", "analyzing", "generating", "ready", "failed"]},
+    "status": {"enum": ["queued", "extracting", "suggesting", "annotating", "analyzing", "generating", "verifying", "correcting", "ready", "failed"]},
+    "pipeline": {"enum": ["manual_pairs", "plan3", "gpt_targeted_sam2", "gemini_video"]},
+    "pipelineConfig": {"anyOf": [{"$ref": "#/$defs/pipelineConfig"}, {"type": "null"}]},
+    "pipelineProgress": {"anyOf": [{"$ref": "#/$defs/pipelineProgress"}, {"type": "null"}]},
     "frames": {"type": "array", "items": {"$ref": "#/$defs/frame"}},
     "tracks": {"type": "array", "items": {"$ref": "#/$defs/track"}},
     "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+    "annotations": {"type": "array", "items": {"$ref": "#/$defs/annotation"}},
+    "annotationSuggestions": {"anyOf": [{"$ref": "#/$defs/annotationSuggestions"}, {"type": "null"}]},
     "analysis": {"anyOf": [{"$ref": "#/$defs/analysis"}, {"type": "null"}]},
     "guide": {"anyOf": [{"$ref": "#/$defs/guide"}, {"type": "null"}]},
+    "guideRevision": {"type": "integer", "minimum": 0},
+    "partTracks": {"type": "array", "items": {"$ref": "#/$defs/partTrack"}},
+    "trackingProgress": {"anyOf": [{"type": "number", "minimum": 0, "maximum": 1}, {"type": "null"}]},
+    "verification": {"anyOf": [{"$ref": "#/$defs/verification"}, {"type": "null"}]},
+    "timeline": {"anyOf": [{"$ref": "#/$defs/actionTimeline"}, {"type": "null"}]},
+    "inferenceMetrics": {"type": "object", "additionalProperties": {"type": "number"}},
     "error": {"anyOf": [{"$ref": "#/$defs/error"}, {"type": "null"}]}
+    ,"storyboard": {"anyOf": [{"$ref": "#/$defs/storyboard"}, {"type": "null"}]}
   },
   "$defs": {
     "frame": {
@@ -51,9 +63,69 @@
         "afterFrameId": {"type": "string", "minLength": 1},
         "evidenceStrength": {"type": "number", "minimum": 0, "maximum": 1},
         "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "evidence": {"type": "string", "minLength": 1}
+        "evidence": {"type": "string", "minLength": 1},
+        "movingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "receivingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "sourceStartTimestampSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "sourceEndTimestampSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]}
       },
       "additionalProperties": false
+    },
+    "annotation": {
+      "type": "object",
+      "required": ["partId", "name", "frameIndex", "points", "labels", "box"],
+      "properties": {
+        "partId": {"type": "integer", "minimum": 0},
+        "name": {"type": "string", "minLength": 1},
+        "frameIndex": {"type": "integer", "minimum": 0},
+        "points": {"type": "array", "items": {"$ref": "#/$defs/point"}},
+        "labels": {"type": "array", "items": {"type": "integer"}},
+        "box": {"anyOf": [{"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}, {"type": "number"}], "items": false}, {"type": "null"}]},
+        "provisionalAnchor": {"type": "boolean"},
+        "referenceFrameId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "referenceTimestampSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "coordinateSpace": {"const": "pixels"},
+        "referenceImageWidth": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "referenceImageHeight": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "referenceImageSha256": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "point": {
+      "type": "object", "required": ["x", "y"],
+      "properties": {"x": {"type": "number", "minimum": 0}, "y": {"type": "number", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "observation": {
+      "type": "object",
+      "required": ["frameIndex", "visible", "provenance"],
+      "properties": {
+        "frameIndex": {"type": "integer", "minimum": 0},
+        "timestampSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "centroid": {"anyOf": [{"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false}, {"type": "null"}]},
+        "bbox": {"anyOf": [{"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}, {"type": "number"}], "items": false}, {"type": "null"}]},
+        "orientationDegrees": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+        "visible": {"type": "boolean"},
+        "provenance": {"enum": ["measured", "interpolated", "missing", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "partTrack": {
+      "type": "object",
+      "required": ["partId", "name", "observations", "attachmentStartFrame", "attachmentEndFrame"],
+      "properties": {
+        "partId": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "minLength": 1},
+        "observations": {"type": "array", "items": {"$ref": "#/$defs/observation"}},
+        "attachmentStartFrame": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "attachmentEndFrame": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "attachmentRanges": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0}, {"type": "integer", "minimum": 0}], "items": false}}
+      },
+      "additionalProperties": false
+    },
+    "annotationSuggestions": {
+      "type": "object", "required": ["status", "frameIndex", "suggestions", "message"],
+      "properties": {"status": {"enum": ["completed", "unavailable", "pending"]}, "frameIndex": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}, "suggestions": {"type": "array"}, "message": {"anyOf": [{"type": "string"}, {"type": "null"}]}}
     },
     "analysis": {
       "type": "object",
@@ -71,9 +143,18 @@
       "type": "object",
       "required": ["text", "frameId", "uncertainty"],
       "properties": {
+        "stepId": {"type": "string"},
         "text": {"type": "string", "minLength": 1},
         "frameId": {"type": "string", "minLength": 1},
-        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "sourceEventIds": {"type": "array", "items": {"type": "string"}},
+        "sourceActionIds": {"type": "array", "items": {"type": "string"}},
+        "evidenceFrameIds": {"type": "array", "items": {"type": "string"}},
+        "kind": {"enum": ["instruction", "review"]},
+        "reviewStatus": {"enum": ["unreviewed", "supported", "rejected", "unresolved"]},
+        "movingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "receivingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
+        ,"sourcePairId": {"anyOf": [{"type": "string"}, {"type": "null"}]}
       },
       "additionalProperties": false
     },
@@ -94,6 +175,178 @@
         "message": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
+    },
+    "finding": {
+      "type": "object",
+      "required": ["findingId", "stepId", "kind", "rationale", "evidenceFrameIds", "suggestedText", "intervalId", "disposition", "movingPartId", "receivingPartId"],
+      "properties": {
+        "findingId": {"type": "string", "minLength": 1},
+        "stepId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "kind": {"enum": ["supported", "correction", "uncertain", "missing", "rejected"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "evidenceFrameIds": {"type": "array", "items": {"type": "string"}},
+        "suggestedText": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "intervalId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "disposition": {"enum": ["supported", "merged", "rejected", "unresolved"]},
+        "movingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "receivingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "change": {
+      "type": "object",
+      "required": ["changeId", "kind", "sourceStepIds", "text", "frameId", "evidenceFrameIds", "targetIndex", "sourceEventIds", "movingPartId", "receivingPartId", "uncertainty"],
+      "properties": {
+        "changeId": {"type": "string", "minLength": 1}, "kind": {"enum": ["rewrite", "merge", "remove", "reorder", "insert"]},
+        "sourceStepIds": {"type": "array", "items": {"type": "string"}}, "text": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "frameId": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "evidenceFrameIds": {"type": "array", "items": {"type": "string"}},
+        "targetIndex": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}, "sourceEventIds": {"type": "array", "items": {"type": "string"}}, "sourceActionIds": {"type": "array", "items": {"type": "string"}},
+        "movingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}, "receivingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "reviewPass": {
+      "type": "object",
+      "required": ["passId", "kind", "revision", "coverage", "findings", "proposedChanges", "message"],
+      "properties": {
+        "passId": {"type": "string", "minLength": 1}, "kind": {"enum": ["initial", "recovery", "final"]}, "revision": {"type": "integer", "minimum": 0},
+        "coverage": {"type": "number", "minimum": 0, "maximum": 1}, "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+        "proposedChanges": {"type": "array", "items": {"$ref": "#/$defs/change"}}, "message": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "required": ["status", "resultStatus", "revision", "coverage", "supportedCount", "rejectedCount", "unresolvedCount", "findings", "proposedChanges", "reviewPasses", "appliedChanges", "originalGuide", "correctedGuide", "message"],
+      "properties": {
+        "status": {"enum": ["completed", "unavailable", "stale", "pending"]}, "resultStatus": {"enum": ["passed", "needs_review", "unresolved", "unavailable"]},
+        "revision": {"type": "integer", "minimum": 0}, "coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "supportedCount": {"type": "integer", "minimum": 0}, "rejectedCount": {"type": "integer", "minimum": 0}, "unresolvedCount": {"type": "integer", "minimum": 0},
+        "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}}, "proposedChanges": {"type": "array", "items": {"$ref": "#/$defs/change"}},
+        "reviewPasses": {"type": "array", "items": {"$ref": "#/$defs/reviewPass"}}, "appliedChanges": {"type": "array", "items": {"$ref": "#/$defs/change"}},
+        "originalGuide": {"anyOf": [{"$ref": "#/$defs/guide"}, {"type": "null"}]}, "correctedGuide": {"anyOf": [{"$ref": "#/$defs/guide"}, {"type": "null"}]},
+        "message": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+      }
+    },
+    "timelineAction": {
+      "type": "object",
+      "required": ["actionId", "startTimestampSeconds", "endTimestampSeconds", "actionType", "evidence"],
+      "properties": {
+        "actionId": {"type": "string", "minLength": 1},
+        "startTimestampSeconds": {"type": "number", "minimum": 0},
+        "endTimestampSeconds": {"type": "number", "minimum": 0},
+        "actionType": {"enum": ["attach", "detach", "move", "separate", "unknown"]},
+        "movingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "receivingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "beforeFrameId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "afterFrameId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "beforeRequestedTimestampSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "afterRequestedTimestampSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "evidenceRequestedTimestampSeconds": {"type": "array", "items": {"type": "number", "minimum": 0}},
+        "resolutionErrorSeconds": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "evidenceFrameIds": {"type": "array", "items": {"type": "string"}},
+        "evidenceRoles": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+        "observationIds": {"type": "array", "items": {"type": "string"}},
+        "supersedesActionIds": {"type": "array", "items": {"type": "string"}},
+        "relationshipBefore": {"enum": ["attached", "separate", "unknown"]},
+        "relationshipAfter": {"enum": ["attached", "separate", "unknown"]},
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "evidence": {"type": "string", "minLength": 1},
+        "sourceWindowId": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "actionTimeline": {
+      "type": "object",
+      "required": ["schemaVersion", "sourceOrder", "durationSeconds", "actions", "unresolvedIntervals"],
+      "properties": {
+        "schemaVersion": {"type": "string", "minLength": 1},
+        "sourceOrder": {"const": "source"},
+        "sourceDirection": {"enum": ["disassembly", "assembly", "mixed", "unknown"]},
+        "durationSeconds": {"type": "number", "minimum": 0},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/timelineAction"}},
+        "unresolvedIntervals": {"type": "array", "items": {"$ref": "#/$defs/timelineAction"}},
+        "assemblyActions": {"type": "array", "items": {"$ref": "#/$defs/assemblyAction"}}
+      },
+      "additionalProperties": false
+    },
+    "assemblyAction": {
+      "type": "object",
+      "required": ["mappingId", "sourceActionIds", "actionType", "evidenceFrameIds", "relationshipBefore", "relationshipAfter", "disposition", "sourceDirection"],
+      "properties": {
+        "mappingId": {"type": "string", "minLength": 1},
+        "sourceActionIds": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "assemblyOrdinal": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "actionType": {"enum": ["attach", "detach", "move", "separate", "unknown"]},
+        "movingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "receivingPartId": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "beforeFrameId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "afterFrameId": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "evidenceFrameIds": {"type": "array", "items": {"type": "string"}},
+        "relationshipBefore": {"enum": ["attached", "separate", "unknown"]},
+        "relationshipAfter": {"enum": ["attached", "separate", "unknown"]},
+        "disposition": {"enum": ["instruction", "review", "grouped", "omitted"]},
+        "sourceDirection": {"enum": ["disassembly", "assembly", "mixed", "unknown"]},
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "pairFinding": {
+      "type": "object", "required": ["status", "beforeAfterDifference"],
+      "properties": {
+        "status": {"enum": ["change", "no_change", "unclear"]},
+        "changedPieceDescription": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "receivingPieceDescription": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "receivingLocation": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "beforeAfterDifference": {"type": "string", "minLength": 1},
+        "supportedPlacement": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "uncertainty": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "reason": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "suggestion": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      }, "additionalProperties": false
+    },
+    "storyboardPair": {
+      "type": "object", "required": ["pairId", "beforeFrameId", "afterFrameId", "beforeTimestampSeconds", "afterTimestampSeconds", "status", "rawFinding", "reviewedFinding", "disposition", "error", "attempt"],
+      "properties": {
+        "pairId": {"type": "string", "minLength": 1}, "beforeFrameId": {"type": "string", "minLength": 1}, "afterFrameId": {"type": "string", "minLength": 1},
+        "beforeTimestampSeconds": {"type": "number", "minimum": 0}, "afterTimestampSeconds": {"type": "number", "minimum": 0},
+        "status": {"enum": ["pending", "completed", "failed"]},
+        "rawFinding": {"anyOf": [{"$ref": "#/$defs/pairFinding"}, {"type": "null"}]}, "reviewedFinding": {"anyOf": [{"$ref": "#/$defs/pairFinding"}, {"type": "null"}]},
+        "disposition": {"anyOf": [{"enum": ["include", "skip"]}, {"type": "null"}]}, "error": {"anyOf": [{"$ref": "#/$defs/error"}, {"type": "null"}]}, "attempt": {"type": "integer", "minimum": 0}
+      }, "additionalProperties": false
+    },
+    "storyboard": {
+      "type": "object", "required": ["schemaVersion", "revision", "selectedFrameIds", "context", "pairs"],
+      "properties": {
+        "schemaVersion": {"type": "string"}, "revision": {"type": "integer", "minimum": 0}, "selectedFrameIds": {"type": "array", "minItems": 2, "items": {"type": "string"}}, "context": {"type": "string"}, "pairs": {"type": "array", "items": {"$ref": "#/$defs/storyboardPair"}}, "guideStale": {"type": "boolean"}
+      }, "additionalProperties": false
+    },
+    "pipelineConfig": {
+      "type": "object",
+      "required": ["pipeline", "model", "reasoningConfiguration", "sam2Enabled", "geminiPreview"],
+      "properties": {
+        "pipeline": {"enum": ["manual_pairs", "plan3", "gpt_targeted_sam2", "gemini_video"]},
+        "model": {"type": "string", "minLength": 1},
+        "reasoningConfiguration": {"type": "object", "additionalProperties": {"type": ["string", "integer", "number", "boolean"]}},
+        "sam2Enabled": {"type": "boolean"},
+        "geminiPreview": {"type": "boolean"},
+        "comparisonModel": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "writerModel": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "createdAt": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "pipelineProgress": {
+      "type": "object",
+      "required": ["stage", "progress"],
+      "properties": {
+        "stage": {"enum": ["extracting", "snapshots", "inventory", "comparing", "reviewing", "understanding", "tracking", "drafting", "writing", "verifying", "recovering", "correcting", "ready", "failed"]},
+        "progress": {"type": "number", "minimum": 0, "maximum": 1},
+        "message": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
     }
-  }
 }

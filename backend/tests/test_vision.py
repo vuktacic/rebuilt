@@ -32,14 +32,26 @@ def test_sam2_attachment_requires_sustained_overlap_and_reverses_event_order() -
 
     moving = [observation(frame, (0, 0, 10, 10) if frame < 3 else (30, 0, 10, 10)) for frame in range(7)]
     anchor = [observation(frame, (0, 0, 10, 10)) for frame in range(7)]
-    separate, attached = Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor])
+    anchor_track = PartTrack(partId=2, name="base plate", observations=anchor)
+    separate, attached, target_part_id = Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor_track])
 
     assert (separate, attached) == (3, 2)
+    assert target_part_id == 2
     analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=Path(".data-test"), analysis_fps=2))
-    events = analyzer._events_from_part_tracks([
-        PartTrack(partId=1, name="side panel", observations=moving, attachmentStartFrame=separate, attachmentEndFrame=attached),
-    ])
+    moving_track = PartTrack(
+        partId=1,
+        name="side panel",
+        observations=moving,
+        attachmentStartFrame=separate,
+        attachmentEndFrame=attached,
+    )
+    anchor_track.attachmentStartFrame = separate
+    anchor_track.attachmentEndFrame = attached
+    events = analyzer._events_from_part_tracks([moving_track, anchor_track], {1: 2, 2: 1})
     assert [(event.beforeFrameId, event.afterFrameId) for event in events] == [("frame-0003", "frame-0002")]
+    assert events[0].kind == "attach"
+    assert events[0].affectedTrackIds == ["part:1", "part:2"]
+    assert events[0].evidence == "side panel moves into sustained substantial overlap with base plate."
     assert events[0].startTimestampSeconds < events[0].endTimestampSeconds
 
 
@@ -49,15 +61,53 @@ def test_sam2_attachment_rejects_transient_overlap() -> None:
 
     moving = [observation(frame, (0, 0, 10, 10) if frame == 1 else (30, 0, 10, 10)) for frame in range(7)]
     anchor = [observation(frame, (0, 0, 10, 10)) for frame in range(7)]
-    assert Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor]) == (None, None)
+    anchor_track = PartTrack(partId=2, name="base plate", observations=anchor)
+    assert Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor_track]) == (None, None, None)
+
+
+def test_sam2_missing_piece_becomes_an_llm_recovery_event() -> None:
+    missing = [
+        TrackObservation(frameIndex=frame, visible=frame >= 2, bbox=(30, 0, 10, 10) if frame >= 2 else None)
+        for frame in range(6)
+    ]
+    anchor = [
+        TrackObservation(frameIndex=frame, visible=True, bbox=(0, 0, 20, 20), centroid=(10, 10))
+        for frame in range(6)
+    ]
+    analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=Path(".data-test"), analysis_fps=2))
+
+    events = analyzer._events_from_part_tracks([
+        PartTrack(partId=1, name="red roof", observations=missing),
+        PartTrack(partId=2, name="blue base", observations=anchor),
+    ])
+
+    assert len(events) == 1
+    assert events[0].kind == "uncertain_change"
+    assert events[0].beforeFrameId == "frame-0002"
+    assert events[0].afterFrameId == "frame-0001"
+    assert "red roof is visible while separate" in events[0].evidence
+    assert "blue base" in events[0].evidence
+    assert "tracker lost red roof" in (events[0].uncertainty or "")
+
+
+def test_sam2_missing_piece_at_recording_boundary_is_preserved_as_uncertain() -> None:
+    observations = [
+        TrackObservation(frameIndex=0, visible=True, bbox=(0, 0, 10, 10), centroid=(5, 5), provenance="measured", timestampSeconds=0),
+        TrackObservation(frameIndex=1, visible=False, provenance="missing", timestampSeconds=0.5),
+        TrackObservation(frameIndex=2, visible=False, provenance="missing", timestampSeconds=1),
+    ]
+
+    assert Sam2BackwardVisionAnalyzer._missing_transitions(observations) == [(0, 0)]
 
 
 class SamplingSam2Provider:
     def __init__(self) -> None:
         self.loaded_frame_names: list[str] = []
         self.prompt_frames: list[int] = []
+        self.frame_dir: Path | None = None
 
     def init_state(self, frame_dir: str) -> object:
+        self.frame_dir = Path(frame_dir)
         self.loaded_frame_names = sorted(path.name for path in Path(frame_dir).glob("*.jpg"))
         return object()
 
@@ -66,6 +116,8 @@ class SamplingSam2Provider:
 
     def propagate_in_video(self, state: object, *, start_frame_idx: int, reverse: bool):
         assert reverse is True
+        assert self.frame_dir is not None and self.frame_dir.is_dir()
+        assert len(list(self.frame_dir.glob("*.jpg"))) == start_frame_idx + 1
         for frame_idx in range(start_frame_idx, -1, -1):
             yield frame_idx, [1], [[[[-1.0, -1.0], [-1.0, -1.0]]]]
 
@@ -85,13 +137,14 @@ def test_sam2_fast_profile_tracks_sampled_frames_and_restores_source_frame_index
         frame_dir,
         frame_count=5,
         job_id="sampled",
-        annotations=[PartAnnotation(name="panel", frameIndex=4, points=[PointPrompt(x=1, y=1)])],
+        annotations=[PartAnnotation(partId=7, name="panel", frameIndex=4, points=[PointPrompt(x=1, y=1)])],
     )
 
     assert provider.loaded_frame_names == ["000000.jpg", "000001.jpg", "000002.jpg"]
     assert provider.prompt_frames == [2]
     assert [item.frameIndex for item in result.part_tracks[0].observations] == [0, 1, 2, 3, 4]
     assert result.analysis.metrics["sampled_frames"] == 3.0
+    assert result.part_tracks[0].partId == 7
 
 
 def test_sam2_analyzer_reuses_the_loaded_provider_between_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,12 +8,17 @@ mode visible and mock results are never used for live failures.
 When the FastAPI app is running, open:
 
 ```text
-http://localhost:8000/?mock=1
+http://localhost:8000/
 ```
 
 Use a filename containing `fail` in mock mode to rehearse a processing failure.
 The API client polls every two seconds, keeps edits in the browser until the
 explicit Save action, and restores a saved job from the `job` query parameter.
+
+The default selector is **Manual snapshots + Astra**. After extraction, select
+settled source states, save the storyboard, review each adjacent-pair finding,
+and explicitly include or skip every pair before generating the editable guide.
+No alternate pipeline is selectable.
 
 Run the dependency-free frontend tests with:
 

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Turn a LEGO build recording into editable illustrated instructions." />
+    <meta name="description" content="Turn an object-assembly recording into editable illustrated instructions." />
     <title>Rebuilt — video to instructions</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -58,7 +58,7 @@
               <span class="stage-number">01</span>
               <div><p class="stage-kicker">Source</p><h2 id="upload-heading">Add your recording</h2></div>
             </div>
-            <p class="panel-copy">Use a short, fixed-camera video. A clear pause between movements gives the tracker stronger evidence.</p>
+            <p class="panel-copy">Use a short, fixed-camera video. Choose the reasoning pipeline before upload; the choice is fixed for this run.</p>
             <form id="upload-form">
               <label id="drop-zone" class="drop-zone" for="video-input">
                 <input id="video-input" type="file" name="video" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv" />
@@ -66,6 +66,7 @@
                 <span class="drop-copy"><b>Drop a video here</b><small>or choose from your device · up to 250 MB</small></span>
                 <span id="selected-file" class="selected-file" hidden></span>
               </label>
+              <label class="pipeline-select" for="pipeline-select"><span>Analysis workflow</span><select id="pipeline-select" disabled><option value="manual_pairs">Manual snapshots + Astra</option></select><small id="pipeline-disclosure">Select settled snapshots; Astra compares adjacent pairs and Luna writes the reviewed guide.</small></label>
               <button id="upload-button" class="button button-primary" type="submit" disabled>Begin analysis <span aria-hidden="true">↗</span></button>
             </form>
           </section>
@@ -87,11 +88,19 @@
         </div>
       </section>
 
+      <section id="manual-panel" class="result-section annotation-panel" aria-labelledby="manual-heading" hidden>
+        <div class="section-heading"><div class="section-index"><span>03</span></div><div class="section-title"><p class="stage-kicker">Manual snapshots</p><h2 id="manual-heading">Choose the states that matter</h2><p class="panel-copy">Select the initial state and one clear settled frame after each action. Snapshots are kept in source order and compared as adjacent pairs.</p></div></div>
+        <div class="annotation-workspace">
+          <div class="annotation-stage"><img id="manual-image" alt="Selected extracted state snapshot" /></div>
+          <div class="annotation-controls"><label>Frame <input id="manual-frame" type="range" min="0" value="0" /><span id="manual-frame-label"></span></label><div class="button-row"><button id="manual-prev" class="button button-secondary" type="button">Previous</button><button id="manual-next" class="button button-secondary" type="button">Next</button><button id="manual-add" class="button button-secondary" type="button">Add snapshot</button></div><div id="manual-snapshot-list" class="annotation-list"></div><label>Optional piece names or context<textarea id="manual-context" rows="3" placeholder="e.g. blue base, red roof"></textarea></label><button id="manual-save" class="button button-secondary" type="button">Save snapshots</button><button id="manual-compare" class="button button-primary" type="button" disabled>Compare snapshot pairs ↗</button><div id="manual-pairs" class="annotation-list"></div><button id="manual-review-save" class="button button-secondary" type="button" disabled>Save reviewed differences</button><button id="manual-generate" class="button button-primary" type="button" disabled>Write editable guide ↗</button></div>
+        </div>
+      </section>
+
       <section id="annotation-panel" class="result-section annotation-panel" aria-labelledby="annotation-heading" hidden>
-        <div class="section-heading"><div class="section-index"><span>03</span></div><div class="section-title"><p class="stage-kicker">Manual prompt</p><h2 id="annotation-heading">Name parts on the final frame</h2><p class="panel-copy">The scrubber starts at the fully disassembled final frame. Click a visible part, name it, then add it. You can move to an earlier frame for one fallback prompt.</p></div></div>
+        <div class="section-heading"><div class="section-index"><span>03</span></div><div class="section-title"><p class="stage-kicker">Manual prompt</p><h2 id="annotation-heading">Name parts on the final frame</h2><p class="panel-copy">The scrubber starts at the fully disassembled final frame. Click a visible part, name it, then add it. You can move to an earlier frame for one fallback prompt. Selected frames used for suggestions or verification are sent to OpenAI.</p></div></div>
         <div class="annotation-workspace">
           <div class="annotation-stage"><img id="annotation-image" alt="Selected extracted frame for part annotation" /><div id="annotation-markers" class="annotation-markers"></div></div>
-          <div class="annotation-controls"><label>Frame <input id="annotation-frame" type="range" min="0" value="0" /><span id="annotation-frame-label"></span></label><label>Part name <input id="annotation-name" type="text" placeholder="e.g. side panel" /></label><p id="annotation-hint" class="annotation-hint">Click a part in the image, then add the named point.</p><button id="add-annotation-button" class="button button-secondary" type="button" disabled>Add named point</button><div id="annotation-list" class="annotation-list"></div><button id="track-backward-button" class="button button-primary" type="button" disabled>Track backward ↗</button></div>
+          <div class="annotation-controls"><label>Frame <input id="annotation-frame" type="range" min="0" value="0" /><span id="annotation-frame-label"></span></label><label>Part name <input id="annotation-name" type="text" placeholder="e.g. side panel" /></label><p id="annotation-hint" class="annotation-hint">Click a part in the image, then add the named point.</p><button id="suggest-annotations-button" class="button button-secondary" type="button">Suggest on this frame</button><div id="suggestion-list" class="annotation-list"></div><button id="add-annotation-button" class="button button-secondary" type="button" disabled>Add named point</button><div id="annotation-list" class="annotation-list"></div><button id="track-backward-button" class="button button-primary" type="button" disabled>Track backward ↗</button><button id="analyze-pipeline-button" class="button button-primary" type="button" disabled>Confirm pieces and analyze ↗</button></div>
         </div>
       </section>
 
@@ -113,8 +122,9 @@
         <div class="section-heading guide-heading-row">
           <div class="section-index"><span>04</span></div>
           <div class="section-title"><p class="stage-kicker">Final output</p><h2 id="guide-heading">Your reassembly guide</h2><p class="panel-copy">Refine the instructions and choose the clearest reference frame before saving.</p></div>
-          <div class="guide-actions"><span id="dirty-label" class="dirty-label" hidden>Unsaved</span><button id="save-button" class="button button-primary" type="button">Save guide <span aria-hidden="true">✓</span></button></div>
+          <div class="guide-actions"><span id="dirty-label" class="dirty-label" hidden>Unsaved</span><button id="verify-button" class="button button-secondary" type="button">Verify against images</button><button id="save-button" class="button button-primary" type="button">Save guide <span aria-hidden="true">✓</span></button></div>
         </div>
+        <div id="verification-summary" class="review-summary" hidden></div>
         <div id="save-error" class="error-box" role="alert" hidden></div>
         <label class="title-field" for="guide-title"><span>Guide title</span><input id="guide-title" data-field="title" type="text" autocomplete="off" /></label>
         <div id="steps-list" class="steps-list"></div>

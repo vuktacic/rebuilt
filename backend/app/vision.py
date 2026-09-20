@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -97,66 +98,79 @@ class Sam2BackwardVisionAnalyzer:
         provider = self._provider
         source_indices = self._sampled_source_indices(frame_count, annotations)
         source_to_sampled_index = {source_index: sampled_index for sampled_index, source_index in enumerate(source_indices)}
-        with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
-            sam2_frame_dir = Path(temporary_dir)
-            source_frames = sorted(frame_dir.glob("frame-*.jpg"))
-            if len(source_frames) != frame_count:
-                raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
-            for sampled_index, source_index in enumerate(source_indices):
-                (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_frames[source_index].resolve())
+        # SAM2 keeps the frame-directory path in its inference state and can
+        # load frames lazily while propagating.  Keep this directory alive for
+        # the whole request, rather than deleting it immediately after state
+        # initialization.
+        temporary_frames = tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-")
+        sam2_frame_dir = Path(temporary_frames.name)
+        source_frames = sorted(frame_dir.glob("frame-*.jpg"))
+        if len(source_frames) != frame_count:
+            raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
+        for sampled_index, source_index in enumerate(source_indices):
+            (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_frames[source_index].resolve())
+        with self._inference_context():
             state = self._initialize_state(provider, sam2_frame_dir)
         object_ids: dict[str, int] = {}
-        for annotation in annotations:
-            name = annotation.name.strip()
-            object_id = object_ids.setdefault(name, len(object_ids) + 1)
-            points = [[point.x, point.y] for point in annotation.points] or None
-            labels = annotation.labels or ([1] * len(annotation.points) if annotation.points else None)
-            if points is not None and len(points) != len(labels or []):
-                raise AppError(422, "ANNOTATION_INVALID", "Each point prompt needs a matching foreground or background label.")
-            if not points and annotation.box is None:
-                raise AppError(422, "ANNOTATION_INVALID", "Each part needs at least one point or a bounding box.")
-            provider.add_new_points_or_box(
-                state,
-                frame_idx=source_to_sampled_index[annotation.frameIndex],
-                obj_id=object_id,
-                points=points,
-                labels=labels,
-                box=list(annotation.box) if annotation.box is not None else None,
-                clear_old_points=False,
-            )
+        part_ids: dict[str, int] = {}
+        with self._inference_context():
+            for annotation in annotations:
+                name = annotation.name.strip()
+                object_id = object_ids.setdefault(name, len(object_ids) + 1)
+                part_ids.setdefault(name, annotation.partId or object_id)
+                points = [[point.x, point.y] for point in annotation.points] or None
+                labels = annotation.labels or ([1] * len(annotation.points) if annotation.points else None)
+                if points is not None and len(points) != len(labels or []):
+                    raise AppError(422, "ANNOTATION_INVALID", "Each point prompt needs a matching foreground or background label.")
+                if not points and annotation.box is None:
+                    raise AppError(422, "ANNOTATION_INVALID", "Each part needs at least one point or a bounding box.")
+                provider.add_new_points_or_box(
+                    state,
+                    frame_idx=source_to_sampled_index[annotation.frameIndex],
+                    obj_id=object_id,
+                    points=points,
+                    labels=labels,
+                    box=list(annotation.box) if annotation.box is not None else None,
+                    clear_old_points=False,
+                )
 
         observations: dict[int, dict[int, TrackObservation]] = {object_id: {} for object_id in object_ids.values()}
-        for processed, (frame_index, returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
-            state,
-            start_frame_idx=len(source_indices) - 1,
-            reverse=True,
-        ), start=1):
-            if on_progress is not None:
-                on_progress(min(1.0, processed / len(source_indices)))
-            for object_id, mask_logits_for_object in zip(returned_ids, self._mask_items(mask_logits), strict=False):
-                numeric_id = int(object_id)
-                if numeric_id in observations:
-                    source_index = source_indices[int(frame_index)]
-                    observations[numeric_id][source_index] = self._observation(source_index, mask_logits_for_object)
+        with self._inference_context():
+            for processed, (frame_index, returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
+                state,
+                start_frame_idx=len(source_indices) - 1,
+                reverse=True,
+            ), start=1):
+                if on_progress is not None:
+                    on_progress(min(1.0, processed / len(source_indices)))
+                for object_id, mask_logits_for_object in zip(returned_ids, self._mask_items(mask_logits), strict=False):
+                    numeric_id = int(object_id)
+                    if numeric_id in observations:
+                        source_index = source_indices[int(frame_index)]
+                        observations[numeric_id][source_index] = self._observation(source_index, mask_logits_for_object)
 
         tracks: list[PartTrack] = []
         for name, object_id in object_ids.items():
-            chronological = self._restore_source_observations(observations[object_id], frame_count)
+            chronological = self._restore_source_observations(observations[object_id], frame_count, self.settings.analysis_fps)
             tracks.append(PartTrack(
-                partId=object_id,
+                partId=part_ids[name],
                 name=name,
                 observations=chronological,
                 attachmentStartFrame=None,
                 attachmentEndFrame=None,
             ))
+        attachment_targets: dict[int, list[int]] = {}
         for track in tracks:
-            separate_frame, attached_frame = self._attachment_range(
+            ranges = self._attachment_ranges(
                 track.observations,
-                [other.observations for other in tracks if other.partId != track.partId],
+                [other for other in tracks if other.partId != track.partId],
             )
-            track.attachmentStartFrame = separate_frame
-            track.attachmentEndFrame = attached_frame
-        events = self._events_from_part_tracks(tracks)
+            track.attachmentRanges = [(separate, attached) for _, separate, attached, _ in ranges]
+            if ranges:
+                track.attachmentStartFrame = ranges[0][1]
+                track.attachmentEndFrame = ranges[0][2]
+                attachment_targets[track.partId] = [item[3] for item in ranges]
+        events = self._events_from_part_tracks(tracks, attachment_targets)
         elapsed = time.monotonic() - started
         summaries = [
             TrackSummary(
@@ -207,31 +221,40 @@ class Sam2BackwardVisionAnalyzer:
     def _restore_source_observations(
         sampled: dict[int, TrackObservation],
         frame_count: int,
+        fps: float = 1.0,
     ) -> list[TrackObservation]:
         restored: list[TrackObservation] = []
         sampled_indexes = sorted(sampled)
         for frame_index in range(frame_count):
             exact = sampled.get(frame_index)
             if exact is not None:
-                restored.append(exact)
+                restored.append(exact.model_copy(update={
+                    "timestampSeconds": frame_index / fps,
+                    "provenance": exact.provenance if exact.provenance != "unknown" else (
+                        "measured" if exact.visible and exact.timestampSeconds is None else "missing" if not exact.visible else "unknown"
+                    ),
+                }))
                 continue
             before = max((index for index in sampled_indexes if index < frame_index), default=None)
             after = min((index for index in sampled_indexes if index > frame_index), default=None)
             if before is None or after is None:
-                restored.append(TrackObservation(frameIndex=frame_index, visible=False))
+                restored.append(TrackObservation(frameIndex=frame_index, timestampSeconds=frame_index / fps, visible=False, provenance="missing"))
                 continue
             left, right = sampled[before], sampled[after]
-            if not (left.visible and right.visible and left.bbox and right.bbox and left.centroid and right.centroid):
-                restored.append(TrackObservation(frameIndex=frame_index, visible=False))
+            if not (left.visible and right.visible and left.bbox and right.bbox and left.centroid and right.centroid
+                    and left.provenance == "measured" and right.provenance == "measured"):
+                restored.append(TrackObservation(frameIndex=frame_index, timestampSeconds=frame_index / fps, visible=False, provenance="missing"))
                 continue
             ratio = (frame_index - before) / (after - before)
             interpolate = lambda start, end: start + (end - start) * ratio
             restored.append(TrackObservation(
                 frameIndex=frame_index,
+                timestampSeconds=frame_index / fps,
                 centroid=tuple(interpolate(start, end) for start, end in zip(left.centroid, right.centroid, strict=True)),
                 bbox=tuple(interpolate(start, end) for start, end in zip(left.bbox, right.bbox, strict=True)),
                 orientationDegrees=None if left.orientationDegrees is None or right.orientationDegrees is None else interpolate(left.orientationDegrees, right.orientationDegrees),
                 visible=True,
+                provenance="interpolated",
             ))
         return restored
 
@@ -245,6 +268,9 @@ class Sam2BackwardVisionAnalyzer:
         except ImportError as exc:
             raise VisionUnavailable("SAM2.1 dependencies are unavailable; run scripts/bootstrap_sam2.sh.") from exc
         device = "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and torch.cuda.get_device_properties(0).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         try:
             return build_sam2_video_predictor(
                 self.settings.sam2_model_config,
@@ -255,6 +281,21 @@ class Sam2BackwardVisionAnalyzer:
             )
         except Exception as exc:
             raise VisionUnavailable(f"SAM2.1 could not be loaded: {type(exc).__name__}") from exc
+
+    @contextmanager
+    def _inference_context(self):
+        """Use the official CUDA precision profile without changing CPU/MPS behavior."""
+        try:
+            import torch
+        except ImportError:
+            yield
+            return
+        with torch.inference_mode():
+            if torch.cuda.is_available():
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    yield
+            else:
+                yield
 
     @staticmethod
     def _mask_items(mask_logits: Any) -> list[Any]:
@@ -272,7 +313,7 @@ class Sam2BackwardVisionAnalyzer:
             binary = np.asarray(mask).squeeze() > 0
             ys, xs = np.where(binary)
             if not len(xs):
-                return TrackObservation(frameIndex=frame_index, visible=False)
+                return TrackObservation(frameIndex=frame_index, visible=False, provenance="missing")
             x0, x1, y0, y1 = float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max())
             orientation = None
             if len(xs) >= 2:
@@ -285,19 +326,57 @@ class Sam2BackwardVisionAnalyzer:
                 bbox=(x0, y0, x1 - x0 + 1, y1 - y0 + 1),
                 orientationDegrees=orientation,
                 visible=True,
+                provenance="measured",
             )
         except (ImportError, TypeError, ValueError, AttributeError):
-            return TrackObservation(frameIndex=frame_index, visible=False)
+            return TrackObservation(frameIndex=frame_index, visible=False, provenance="missing")
+
+    @staticmethod
+    def _is_measured_observation(observation: TrackObservation) -> bool:
+        """Accept timestamp-less legacy fixtures as measured observations.
+
+        Runtime observations always carry timestamps.  The compatibility case
+        keeps older serialized/test observations usable without treating an
+        explicitly unknown, timestamped observation as measured evidence.
+        """
+        return (
+            observation.visible
+            and observation.bbox is not None
+            and (
+                observation.provenance == "measured"
+                or (observation.provenance == "unknown" and observation.timestampSeconds is None)
+            )
+        )
 
     @staticmethod
     def _attachment_range(
         observations: list[TrackObservation],
-        other_tracks: list[list[TrackObservation]],
-    ) -> tuple[int | None, int | None]:
+        other_tracks: list[PartTrack],
+    ) -> tuple[int | None, int | None, int | None]:
         """Find an assembly-direction transition from side-by-side to joined.
 
         Source frames are disassembly-order (attached → separate), so a durable
         high-overlap-to-low-overlap transition is inverted for the guide.
+        """
+        candidates = Sam2BackwardVisionAnalyzer._attachment_ranges(observations, other_tracks)
+        if not candidates:
+            return None, None, None
+        _, separate_frame, attached_frame, target_part_id = max(
+            candidates,
+            key=lambda item: (item[0], -item[3]),
+        )
+        return separate_frame, attached_frame, target_part_id
+
+    @staticmethod
+    def _attachment_ranges(
+        observations: list[TrackObservation],
+        other_tracks: list[PartTrack],
+    ) -> list[tuple[float, int, int, int]]:
+        """Return every measured, non-overlapping high-to-low transition.
+
+        SAM2 runs in source/disassembly order. A candidate is only valid when
+        both sides of the interval are measured-visible observations; missing
+        or interpolated observations are preserved as unknown evidence.
         """
         def overlap(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
             lx, ly, lw, lh = left
@@ -305,50 +384,184 @@ class Sam2BackwardVisionAnalyzer:
             intersection = max(0.0, min(lx + lw, rx + rw) - max(lx, rx)) * max(0.0, min(ly + lh, ry + rh) - max(ly, ry))
             return intersection / max(1.0, min(lw * lh, rw * rh))
 
-        scores: list[float] = []
-        for frame, observation in enumerate(observations):
-            if not observation.visible or observation.bbox is None:
-                scores.append(0.0)
-                continue
-            candidates: list[float] = []
-            for candidate in other_tracks:
-                if frame >= len(candidate) or not candidate[frame].visible:
+        candidates: list[tuple[float, int, int, int]] = []
+        for candidate in other_tracks:
+            scores: list[float | None] = []
+            for frame, observation in enumerate(observations):
+                if (
+                    not Sam2BackwardVisionAnalyzer._is_measured_observation(observation)
+                    or frame >= len(candidate.observations)
+                    or not Sam2BackwardVisionAnalyzer._is_measured_observation(candidate.observations[frame])
+                ):
+                    scores.append(None)
                     continue
-                candidate_bbox = candidate[frame].bbox
-                if candidate_bbox is not None:
-                    candidates.append(overlap(observation.bbox, candidate_bbox))
-            scores.append(max(candidates, default=0.0))
-        # Work in source/disassembly order: attached → separate. Two high-score
-        # frames followed by two low-score frames is enough to retain a broad
-        # candidate for the manual. SAM2 can merge nearby parts into one mask
-        # after attachment, so demanding a long clean separation is too strict.
-        for attached in range(0, max(0, len(scores) - 3)):
-            if min(scores[attached:attached + 2]) < 0.30:
+                scores.append(overlap(observation.bbox, candidate.observations[frame].bbox))
+            # Work in source/disassembly order: attached → separate. Two
+            # high-score frames followed by two low-score frames retain both
+            # the transition and the neighboring part that caused it.
+            for attached in range(0, max(0, len(scores) - 3)):
+                high = scores[attached:attached + 2]
+                low = scores[attached + 2:attached + 4]
+                if any(score is None for score in (*high, *low)):
+                    continue
+                if min(high) < 0.30 or max(low) > 0.25:
+                    continue
+                confidence = sum(high) / len(high) - sum(low) / len(low)  # type: ignore[arg-type]
+                candidates.append((confidence, attached + 2, attached + 1, candidate.partId))
+        selected: list[tuple[float, int, int, int]] = []
+        for candidate in sorted(candidates, key=lambda item: (item[1], -item[0], item[3])):
+            if any(
+                item[3] == candidate[3]
+                and not (candidate[1] >= item[1] + 4 or item[1] >= candidate[1] + 4)
+                for item in selected
+            ):
                 continue
-            if max(scores[attached + 2:attached + 4]) > 0.25:
-                continue
-            return attached + 2, attached + 1
-        return None, None
+            selected.append(candidate)
+        return selected
 
-    def _events_from_part_tracks(self, tracks: list[PartTrack]) -> list[AnalysisEvent]:
-        events: list[AnalysisEvent] = []
-        for track in tracks:
-            if track.attachmentStartFrame is None or track.attachmentEndFrame is None:
+    @staticmethod
+    def _transition_motion(track: PartTrack) -> float:
+        start = track.attachmentStartFrame
+        end = track.attachmentEndFrame
+        if start is None or end is None or start >= len(track.observations) or end >= len(track.observations):
+            return 0.0
+        before = track.observations[start].centroid
+        after = track.observations[end].centroid
+        if before is None or after is None:
+            return 0.0
+        return math.hypot(before[0] - after[0], before[1] - after[1])
+
+    @staticmethod
+    def _missing_transitions(observations: list[TrackObservation]) -> list[tuple[int, int]]:
+        """Return uncertain boundaries for every contiguous visibility gap."""
+        transitions: list[tuple[int, int]] = []
+        index = 0
+        while index < len(observations):
+            if Sam2BackwardVisionAnalyzer._is_measured_observation(observations[index]):
+                index += 1
                 continue
+            start = index
+            while index < len(observations) and not Sam2BackwardVisionAnalyzer._is_measured_observation(observations[index]):
+                index += 1
+            end = index
+            before = start - 1
+            after = end
+            before_measured = before >= 0 and Sam2BackwardVisionAnalyzer._is_measured_observation(observations[before])
+            after_measured = after < len(observations) and Sam2BackwardVisionAnalyzer._is_measured_observation(observations[after])
+            if after_measured and (before_measured or start == 0):
+                transitions.append((after, max(0, after - 1)))
+            elif before_measured and end == len(observations):
+                transitions.append((before, max(0, before - 1)))
+        return transitions
+
+    @staticmethod
+    def _missing_transition(observations: list[TrackObservation]) -> tuple[int | None, int | None]:
+        transitions = Sam2BackwardVisionAnalyzer._missing_transitions(observations)
+        return transitions[0] if transitions else (None, None)
+
+    def _events_from_part_tracks(
+        self,
+        tracks: list[PartTrack],
+        attachment_targets: dict[int, int | list[int]] | None = None,
+    ) -> list[AnalysisEvent]:
+        attachment_targets = attachment_targets or {}
+        tracks_by_id = {track.partId: track for track in tracks}
+        attachment_tracks: list[tuple[PartTrack, int, int, int | None]] = []
+        untargeted_tracks: list[tuple[PartTrack, int, int]] = []
+        for track in tracks:
+            ranges = track.attachmentRanges or (
+                [(track.attachmentStartFrame, track.attachmentEndFrame)]
+                if track.attachmentStartFrame is not None and track.attachmentEndFrame is not None
+                else []
+            )
+            if not ranges:
+                continue
+            configured_targets = attachment_targets.get(track.partId)
+            if isinstance(configured_targets, int):
+                configured_targets = [configured_targets]
+            for range_index, (separate_frame, attached_frame) in enumerate(ranges):
+                target_part_id = configured_targets[range_index] if configured_targets and range_index < len(configured_targets) else configured_targets[-1] if configured_targets else None
+                if target_part_id is None or target_part_id not in tracks_by_id:
+                    untargeted_tracks.append((track, separate_frame, attached_frame))
+                else:
+                    attachment_tracks.append((track, separate_frame, attached_frame, target_part_id))
+
+        events: list[AnalysisEvent] = []
+        seen_pairs: set[tuple[tuple[int, int], int, int]] = set()
+        for track, separate_frame, attached_frame, target_part_id in [
+            *attachment_tracks,
+            *((track, separate_frame, attached_frame, None) for track, separate_frame, attached_frame in untargeted_tracks),
+        ]:
+            key = (tuple(sorted((track.partId, target_part_id))) if target_part_id is not None else (track.partId, -1), separate_frame, attached_frame)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            target = tracks_by_id.get(target_part_id)
+            affected_ids = [f"part:{track.partId}"]
+            if target is not None:
+                affected_ids.append(f"part:{target.partId}")
+            source_separate = self._observation_timestamp(track.observations[separate_frame])
+            source_attached = self._observation_timestamp(track.observations[attached_frame])
+            source_start = min(source_separate, source_attached)
+            source_end = max(source_separate, source_attached)
+            duration = self._observation_timestamp(track.observations[-1])
             events.append(AnalysisEvent(
                 eventId=f"event-{len(events) + 1:04d}",
-                kind="uncertain_change",
+                kind="attach",
                 # Reassembly is the inverse of source/disassembly chronology.
-                startTimestampSeconds=(track.observations[-1].frameIndex - track.attachmentStartFrame) / self.settings.analysis_fps,
-                endTimestampSeconds=(track.observations[-1].frameIndex - track.attachmentEndFrame) / self.settings.analysis_fps,
-                affectedTrackIds=[f"part:{track.partId}"],
-                beforeFrameId=f"frame-{track.attachmentStartFrame:04d}",
-                afterFrameId=f"frame-{track.attachmentEndFrame:04d}",
+                startTimestampSeconds=max(0.0, duration - source_separate),
+                endTimestampSeconds=max(0.0, duration - source_attached),
+                affectedTrackIds=affected_ids,
+                beforeFrameId=f"frame-{separate_frame:04d}",
+                afterFrameId=f"frame-{attached_frame:04d}",
                 evidenceStrength=0.72,
                 uncertainty=None,
-                evidence=f"{track.name} moves from the side into sustained substantial overlap with another tracked part.",
+                evidence=(
+                    f"{track.name} moves into sustained substantial overlap with {target.name}."
+                    if target is not None
+                    else f"{track.name} moves into sustained substantial overlap with another tracked object."
+                ),
+                movingPartId=track.partId,
+                receivingPartId=target_part_id,
+                sourceStartTimestampSeconds=source_start,
+                sourceEndTimestampSeconds=source_end,
             ))
+
+        attached_part_ids = {track.partId for track, _, _, _ in attachment_tracks}
+        for track in tracks:
+            if track.partId in attached_part_ids:
+                continue
+            for separate_frame, attached_frame in self._missing_transitions(track.observations):
+                candidate_names = [candidate.name for candidate in tracks if candidate.partId != track.partId]
+                target_hint = ", ".join(candidate_names) if candidate_names else "another visible object"
+                source_separate = self._observation_timestamp(track.observations[separate_frame])
+                source_attached = self._observation_timestamp(track.observations[attached_frame])
+                duration = self._observation_timestamp(track.observations[-1])
+                events.append(AnalysisEvent(
+                    eventId=f"event-{len(events) + 1:04d}",
+                    kind="uncertain_change",
+                    startTimestampSeconds=max(0.0, duration - source_separate),
+                    endTimestampSeconds=max(0.0, duration - source_attached),
+                    affectedTrackIds=[f"part:{track.partId}"],
+                    beforeFrameId=f"frame-{separate_frame:04d}",
+                    afterFrameId=f"frame-{attached_frame:04d}",
+                    evidenceStrength=0.45,
+                    uncertainty=(
+                        f"The local tracker lost {track.name} at the likely attachment boundary; "
+                        "the supplied frames must confirm the connection."
+                    ),
+                    evidence=(
+                        f"{track.name} is visible while separate, then becomes untracked near {target_hint}. "
+                        "Use the before/after images to recover the visible attachment if possible."
+                    ),
+                    movingPartId=track.partId,
+                    sourceStartTimestampSeconds=min(source_separate, source_attached),
+                    sourceEndTimestampSeconds=max(source_separate, source_attached),
+                ))
         return sorted(events, key=lambda event: event.startTimestampSeconds)
+
+    def _observation_timestamp(self, observation: TrackObservation) -> float:
+        return observation.timestampSeconds if observation.timestampSeconds is not None else observation.frameIndex / self.settings.analysis_fps
 
 
 class MlxSam2BackwardVisionAnalyzer(Sam2BackwardVisionAnalyzer):
@@ -1408,14 +1621,16 @@ class Sam3VisionAnalyzer:
             bbox = self._mask_bbox(mask)
         if bbox is None or len(bbox) != 4:
             return None
-        raw_concept = str(output.get("concept") or output.get("prompt") or "LEGO piece")
+        raw_concept = str(output.get("concept") or output.get("prompt") or "assembly object")
         lowered_concept = raw_concept.lower()
         if "hand" in lowered_concept:
             concept = "hand"
+        elif "lego" in lowered_concept:
+            concept = raw_concept
         elif "assembly" in lowered_concept:
-            concept = "LEGO assembly"
+            concept = "assembly"
         else:
-            concept = "LEGO piece"
+            concept = "assembly object"
         predictor_id = str(output.get("object_id") or output.get("track_id") or output.get("id") or "unknown")
         raw_score = output.get("score", output.get("confidence", 0.0))
         try:

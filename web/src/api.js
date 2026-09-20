@@ -47,6 +47,10 @@ function liveClient(fetchImpl) {
   return {
     mode: "live",
 
+    getCapabilities() {
+      return request("/capabilities");
+    },
+
     async uploadVideo(file) {
       const form = new FormData();
       form.append("video", file, file.name);
@@ -75,6 +79,58 @@ function liveClient(fetchImpl) {
 
     trackBackward(jobId) {
       return request(`/jobs/${encodeURIComponent(jobId)}/track`, { method: "POST" });
+    },
+
+    analyzeJob(jobId) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/analyze`, { method: "POST" });
+    },
+
+    saveStoryboard(jobId, selectedFrameIds, context, revision = null) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/storyboard`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selectedFrameIds, context, revision }),
+      });
+    },
+
+    comparePairs(jobId, pairId = null) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/compare`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pairId ? { pairId } : {}),
+      });
+    },
+
+    saveDifferences(jobId, storyboard) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/differences`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: storyboard.revision, pairs: storyboard.pairs.map((pair) => ({ pairId: pair.pairId, reviewedFinding: pair.reviewedFinding, disposition: pair.disposition })) }),
+      });
+    },
+
+    generateGuide(jobId, revision = null) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/generate-guide`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision }),
+      });
+    },
+
+    suggestAnnotations(jobId, frameIndex = null) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/annotation-suggestions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(frameIndex === null ? {} : { frameIndex }),
+      });
+    },
+
+    verifyGuide(jobId, guide, revision) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ guide, revision }),
+      });
     },
 
     async pollJob(jobId, { onUpdate, signal, intervalMs = 2000 } = {}) {
@@ -144,6 +200,12 @@ function mockClient(options = {}) {
     if (failed && job.polls >= 2) {
       job.status = "failed";
       job.error = { ...FAILED_JOB_FIXTURE.error, message: "The mock processor could not read this video." };
+    } else if (job.pipeline === "manual_pairs" && job.polls === 2) {
+      job.status = "extracting";
+      job.frames = baseFrames();
+    } else if (job.pipeline === "manual_pairs" && job.polls >= 3) {
+      job.status = "annotating";
+      job.frames = job.frames.length ? job.frames : baseFrames();
     } else if (job.polls === 1) {
       job.status = "queued";
     } else if (job.polls === 2) {
@@ -167,6 +229,12 @@ function mockClient(options = {}) {
   return {
     mode: "mock",
 
+    async getCapabilities() {
+      return { pipelines: [
+        { pipeline: "manual_pairs", label: "Manual snapshots + Astra", available: true, missing: [], disclosure: "Mocked snapshot comparison and guide writing." },
+      ] };
+    },
+
     async uploadVideo(file) {
       const jobId = `mock-job-${nextId++}`;
       const job = {
@@ -180,12 +248,70 @@ function mockClient(options = {}) {
         error: null,
         polls: 0,
         shouldFail: file?.name?.toLowerCase().includes("fail"),
+        pipeline: "manual_pairs",
+        storyboard: null,
+        guideRevision: 0,
       };
       remember(job);
       return { jobId };
     },
 
     getJob,
+
+    async saveStoryboard(jobId, selectedFrameIds, context, revision = null) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      const pairs = selectedFrameIds.slice().sort((a, b) => job.frames.find((frame) => frame.frameId === a).timestampSeconds - job.frames.find((frame) => frame.frameId === b).timestampSeconds).slice(1).map((after, index) => {
+        const before = selectedFrameIds.slice().sort((a, b) => job.frames.find((frame) => frame.frameId === a).timestampSeconds - job.frames.find((frame) => frame.frameId === b).timestampSeconds)[index];
+        return { pairId: `pair-${String(index + 1).padStart(4, "0")}`, beforeFrameId: before, afterFrameId: after, beforeTimestampSeconds: job.frames.find((frame) => frame.frameId === before).timestampSeconds, afterTimestampSeconds: job.frames.find((frame) => frame.frameId === after).timestampSeconds, status: "completed", rawFinding: { status: "change", beforeAfterDifference: "A visible piece change was reviewed in mock mode.", changedPieceDescription: "piece", receivingPieceDescription: "assembly", receivingLocation: "visible location", supportedPlacement: "visible", uncertainty: null, reason: null, suggestion: null }, reviewedFinding: { status: "change", beforeAfterDifference: "A visible piece change was reviewed in mock mode.", changedPieceDescription: "piece", receivingPieceDescription: "assembly", receivingLocation: "visible location", supportedPlacement: "visible", uncertainty: null, reason: null, suggestion: null }, disposition: null, error: null, attempt: 1 };
+      });
+      job.storyboard = { schemaVersion: "manual-storyboard-v1", revision: (job.storyboard?.revision || 0) + 1, selectedFrameIds, context, pairs };
+      job.status = "annotating";
+      remember(job);
+      return copy(job);
+    },
+
+    async comparePairs(jobId) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.storyboard?.pairs?.forEach((pair) => { pair.status = "completed"; });
+      remember(job);
+      return copy(job);
+    },
+
+    async saveDifferences(jobId, storyboard) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.storyboard = { ...job.storyboard, ...copy(storyboard), revision: (job.storyboard?.revision || 0) + 1 };
+      remember(job);
+      return copy(job);
+    },
+
+    async generateGuide(jobId) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      const included = (job.storyboard?.pairs || []).filter((pair) => pair.disposition === "include");
+      job.guide = { title: "Mock snapshot guide", steps: included.map((pair, index) => ({ stepId: `step-${String(index + 1).padStart(4, "0")}`, text: `Place the reviewed piece for ${pair.pairId}.`, frameId: pair.afterFrameId, evidenceFrameIds: [pair.beforeFrameId, pair.afterFrameId], sourcePairId: pair.pairId, uncertainty: pair.reviewedFinding?.uncertainty || null })) };
+      job.status = "ready";
+      remember(job);
+      return copy(job);
+    },
+
+    async saveAnnotations(jobId, annotations) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.annotations = copy(annotations);
+      remember(job);
+      return copy(job);
+    },
+
+    async trackBackward(jobId) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.status = "analyzing";
+      remember(job);
+      return copy(job);
+    },
 
     async saveGuide(jobId, guide) {
       const job = restore(jobId);
@@ -197,8 +323,41 @@ function mockClient(options = {}) {
       }
       job.guide = copy(guide);
       job.status = "ready";
+      job.guideRevision = (job.guideRevision || 0) + 1;
+      job.verification = job.verification ? { ...job.verification, status: "stale", revision: job.guideRevision } : null;
       remember(job);
       return copy(job.guide);
+    },
+
+    async suggestAnnotations(jobId, frameIndex = null) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.annotationSuggestions = {
+        status: "completed",
+        frameIndex: frameIndex ?? Math.max(0, job.frames.length - 1),
+        suggestions: [{ partId: 1, name: "suggested piece", frameIndex: frameIndex ?? 0, point: { x: 120, y: 120 }, confidence: 0.82 }],
+        message: null,
+      };
+      remember(job);
+      return copy(job);
+    },
+
+    async analyzeJob(jobId) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.status = "analyzing";
+      remember(job);
+      return copy(job);
+    },
+
+    async verifyGuide(jobId, guide, revision) {
+      const job = restore(jobId);
+      if (!job) throw new ApiError("The requested job does not exist.", { status: 404, code: "JOB_NOT_FOUND" });
+      job.guide = copy(guide || job.guide);
+      job.guideRevision = (revision || job.guideRevision || 0) + 1;
+      job.verification = { status: "completed", resultStatus: "passed", revision: job.guideRevision, coverage: 1, supportedCount: job.guide.steps.length, rejectedCount: 0, unresolvedCount: 0, findings: [], proposedChanges: [], reviewPasses: [], appliedChanges: [], originalGuide: copy(job.guide), message: "Mock verification completed." };
+      remember(job);
+      return copy(job);
     },
 
     async pollJob(jobId, { onUpdate, signal, intervalMs = 2000 } = {}) {

@@ -7,6 +7,7 @@ __pycache__/
 
 private
 .venv-sam3/
+.venv-sam2/
 .venv-arm64/
 .venv-mlx-sam3/
 .models/

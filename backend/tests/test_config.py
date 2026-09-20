@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.app.config import Settings, VisionRuntimeError, _load_dotenv, _read_dotenv, resolve_vision_backend
+from backend.app.config import Settings, VisionRuntimeError, _load_dotenv, _read_dotenv, _read_secret_file, resolve_vision_backend
 
 
 def test_dotenv_parser_reads_values_without_executing_code(tmp_path: Path) -> None:
@@ -25,6 +25,27 @@ def test_dotenv_parser_reads_values_without_executing_code(tmp_path: Path) -> No
     assert environment["OPENAI_MODEL"] == "from-process"
     assert environment["REBUILT_ANALYSIS_FPS"] == "2"
     assert "BROKEN LINE" not in environment
+
+
+def test_gemini_key_file_is_a_single_opaque_line(tmp_path: Path) -> None:
+    token = tmp_path / ".gemini_token"
+    token.write_text("test-gemini-key\n", encoding="utf-8")
+    assert _read_secret_file(token) == "test-gemini-key"
+    token.write_text("first\nsecond\n", encoding="utf-8")
+    assert _read_secret_file(token) is None
+
+
+def test_settings_load_gemini_key_file_with_environment_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = tmp_path / ".gemini_token"
+    token.write_text("file-key\n", encoding="utf-8")
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("", encoding="utf-8")
+    monkeypatch.setenv("REBUILT_ENV_FILE", str(dotenv))
+    monkeypatch.setenv("GEMINI_API_KEY_FILE", str(token))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    assert Settings.from_env(data_dir=tmp_path).gemini_api_key == "file-key"
+    monkeypatch.setenv("GEMINI_API_KEY", "environment-key")
+    assert Settings.from_env(data_dir=tmp_path).gemini_api_key == "environment-key"
 
 
 def test_auto_backend_selects_manual_sam2_tracking_on_supported_hosts(tmp_path: Path) -> None:
