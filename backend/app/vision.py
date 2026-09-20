@@ -97,47 +97,48 @@ class Sam2BackwardVisionAnalyzer:
         provider = self._provider
         source_indices = self._sampled_source_indices(frame_count, annotations)
         source_to_sampled_index = {source_index: sampled_index for sampled_index, source_index in enumerate(source_indices)}
-        with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
-            sam2_frame_dir = Path(temporary_dir)
-            source_frames = sorted(frame_dir.glob("frame-*.jpg"))
-            if len(source_frames) != frame_count:
-                raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
-            for sampled_index, source_index in enumerate(source_indices):
-                (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_frames[source_index].resolve())
-            state = self._initialize_state(provider, sam2_frame_dir)
         object_ids: dict[str, int] = {}
-        for annotation in annotations:
+        observations: dict[int, dict[int, TrackObservation]] = {}
+        for annotation_number, annotation in enumerate(annotations, start=1):
             name = annotation.name.strip()
-            object_id = object_ids.setdefault(name, len(object_ids) + 1)
+            object_id = object_ids.setdefault(name, annotation_number)
+            observations[object_id] = {}
             points = [[point.x, point.y] for point in annotation.points] or None
             labels = annotation.labels or ([1] * len(annotation.points) if annotation.points else None)
             if points is not None and len(points) != len(labels or []):
                 raise AppError(422, "ANNOTATION_INVALID", "Each point prompt needs a matching foreground or background label.")
             if not points and annotation.box is None:
                 raise AppError(422, "ANNOTATION_INVALID", "Each part needs at least one point or a bounding box.")
-            provider.add_new_points_or_box(
-                state,
-                frame_idx=source_to_sampled_index[annotation.frameIndex],
-                obj_id=object_id,
-                points=points,
-                labels=labels,
-                box=list(annotation.box) if annotation.box is not None else None,
-                clear_old_points=False,
-            )
-
-        observations: dict[int, dict[int, TrackObservation]] = {object_id: {} for object_id in object_ids.values()}
-        for processed, (frame_index, returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
-            state,
-            start_frame_idx=len(source_indices) - 1,
-            reverse=True,
-        ), start=1):
-            if on_progress is not None:
-                on_progress(min(1.0, processed / len(source_indices)))
-            for object_id, mask_logits_for_object in zip(returned_ids, self._mask_items(mask_logits), strict=False):
-                numeric_id = int(object_id)
-                if numeric_id in observations:
+            with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
+                sam2_frame_dir = Path(temporary_dir)
+                source_frames = sorted(frame_dir.glob("frame-*.jpg"))
+                if len(source_frames) != frame_count:
+                    raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
+                for sampled_index, source_index in enumerate(source_indices):
+                    (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_frames[source_index].resolve())
+                # MPS can abort when SAM2 batches heterogeneous prompt memory.
+                # Independent one-object states avoid that backend limitation.
+                state = self._initialize_state(provider, sam2_frame_dir)
+                provider.add_new_points_or_box(
+                    state,
+                    frame_idx=source_to_sampled_index[annotation.frameIndex],
+                    obj_id=1,
+                    points=points,
+                    labels=labels,
+                    box=list(annotation.box) if annotation.box is not None else None,
+                    clear_old_points=False,
+                )
+                for processed, (frame_index, _returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
+                    state,
+                    start_frame_idx=len(source_indices) - 1,
+                    reverse=True,
+                ), start=1):
+                    if on_progress is not None:
+                        total = len(source_indices) * len(annotations)
+                        on_progress(min(1.0, ((annotation_number - 1) * len(source_indices) + processed) / total))
                     source_index = source_indices[int(frame_index)]
-                    observations[numeric_id][source_index] = self._observation(source_index, mask_logits_for_object)
+                    mask_for_object = self._mask_items(mask_logits)[0]
+                    observations[object_id][source_index] = self._observation(source_index, mask_for_object)
 
         tracks: list[PartTrack] = []
         for name, object_id in object_ids.items():
