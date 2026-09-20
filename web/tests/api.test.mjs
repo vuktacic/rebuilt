@@ -59,6 +59,19 @@ test("live HTTP errors stay errors instead of silently entering mock mode", asyn
   });
 });
 
+test("live client requests suggestions for the selected frame", async () => {
+  const calls = [];
+  const client = createApiClient({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return response({ jobId: "job-1", status: "annotating", frames: [], annotationSuggestions: { status: "completed", frameIndex: 1, suggestions: [], message: null }, error: null }, 202);
+    },
+  });
+  await client.suggestAnnotations("job-1", 1);
+  assert.equal(calls[0].url, "/jobs/job-1/annotation-suggestions");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { frameIndex: 1 });
+});
+
 test("mock mode simulates progress and persists a successful save", async () => {
   const storage = new MapStorage();
   const client = createApiClient({ mock: true, storage });

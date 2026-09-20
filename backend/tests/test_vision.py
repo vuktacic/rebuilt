@@ -8,6 +8,7 @@ import pytest
 
 import backend.app.vision as vision_module
 from backend.app.config import Settings
+from backend.app.errors import AppError
 from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, PartAnnotation, PartTrack, PointPrompt, TrackObservation, TrackSummary
 from backend.app.processing import ExtractedFrames, JobProcessor
 from backend.app.storage import JobRepository
@@ -22,6 +23,7 @@ from backend.app.vision import (
     Sam3VisionAnalyzer,
     StableStateChangeDetector,
     WindowTrackStitcher,
+    VisionUnavailable,
     VisionWeightsMissing,
 )
 
@@ -56,13 +58,17 @@ class SamplingSam2Provider:
     def __init__(self) -> None:
         self.loaded_frame_names: list[str] = []
         self.prompt_frames: list[int] = []
+        self.prompt_ids: list[int] = []
+        self.state_count = 0
 
     def init_state(self, frame_dir: str) -> object:
+        self.state_count += 1
         self.loaded_frame_names = sorted(path.name for path in Path(frame_dir).glob("*.jpg"))
         return object()
 
-    def add_new_points_or_box(self, state: object, *, frame_idx: int, **_: object) -> None:
+    def add_new_points_or_box(self, state: object, *, frame_idx: int, obj_id: int = 1, **_: object) -> None:
         self.prompt_frames.append(frame_idx)
+        self.prompt_ids.append(obj_id)
 
     def propagate_in_video(self, state: object, *, start_frame_idx: int, reverse: bool):
         assert reverse is True
@@ -92,6 +98,190 @@ def test_sam2_fast_profile_tracks_sampled_frames_and_restores_source_frame_index
     assert provider.prompt_frames == [2]
     assert [item.frameIndex for item in result.part_tracks[0].observations] == [0, 1, 2, 3, 4]
     assert result.analysis.metrics["sampled_frames"] == 3.0
+    assert result.analysis.metrics["tracking_fps"] == 1.0
+    assert result.analysis.metrics["inference_states"] == 1.0
+    assert result.analysis.metrics["objects_per_state"] == 1.0
+
+
+def test_sam2_non_cuda_provider_keeps_one_state_per_part(tmp_path: Path) -> None:
+    provider = SamplingSam2Provider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for index in range(3):
+        (frame_dir / f"frame-{index:04d}.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(
+        Settings(data_dir=tmp_path, analysis_fps=1, sam2_frame_stride=1),
+        provider=provider,
+    )
+
+    result = analyzer.analyze_annotated(
+        frame_dir,
+        frame_count=3,
+        job_id="sequential",
+        annotations=[
+            PartAnnotation(name="panel", frameIndex=2, points=[PointPrompt(x=1, y=1)]),
+            PartAnnotation(name="axle", frameIndex=2, points=[PointPrompt(x=2, y=2)]),
+        ],
+    )
+
+    assert provider.state_count == 2
+    assert provider.prompt_ids == [1, 1]
+    assert len(result.part_tracks or []) == 2
+    assert result.analysis.metrics["inference_states"] == 2.0
+    assert result.analysis.metrics["objects_per_state"] == 1.0
+
+
+class CudaBatchSam2Provider(SamplingSam2Provider):
+    device = SimpleNamespace(type="cuda")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.propagation_count = 0
+
+    def propagate_in_video(self, state: object, *, start_frame_idx: int, reverse: bool):
+        assert reverse is True
+        self.propagation_count += 1
+        for frame_idx in range(start_frame_idx, -1, -1):
+            # Returned IDs are intentionally reversed so list position cannot
+            # be used as the part identity.
+            yield frame_idx, [2, 1], [
+                [[[-1.0, 1.0], [-1.0, -1.0]]],
+                [[[1.0, -1.0], [-1.0, -1.0]]],
+            ]
+
+
+def test_sam2_cuda_batches_objects_and_maps_returned_ids(tmp_path: Path) -> None:
+    provider = CudaBatchSam2Provider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for index in range(3):
+        (frame_dir / f"frame-{index:04d}.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(
+        Settings(data_dir=tmp_path, analysis_fps=1, sam2_frame_stride=1),
+        provider=provider,
+    )
+
+    result = analyzer.analyze_annotated(
+        frame_dir,
+        frame_count=3,
+        job_id="batched",
+        annotations=[
+            PartAnnotation(name="panel", frameIndex=2, points=[PointPrompt(x=1, y=1)]),
+            PartAnnotation(name="axle", frameIndex=2, points=[PointPrompt(x=2, y=2)]),
+        ],
+    )
+
+    assert provider.state_count == 1
+    assert provider.prompt_ids == [1, 2]
+    assert provider.propagation_count == 1
+    assert result.part_tracks is not None
+    assert result.part_tracks[0].observations[-1].bbox == (0.0, 0.0, 1.0, 1.0)
+    assert result.part_tracks[1].observations[-1].bbox == (1.0, 0.0, 1.0, 1.0)
+    assert result.analysis.metrics["inference_states"] == 1.0
+    assert result.analysis.metrics["objects_per_state"] == 2.0
+
+
+def test_sam2_cuda_rejects_incomplete_returned_object_ids(tmp_path: Path) -> None:
+    class IncompleteProvider(CudaBatchSam2Provider):
+        def propagate_in_video(self, state: object, *, start_frame_idx: int, reverse: bool):
+            yield start_frame_idx, [1], [[[[1.0, -1.0], [-1.0, -1.0]]]]
+
+    provider = IncompleteProvider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for index in range(2):
+        (frame_dir / f"frame-{index:04d}.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(
+        Settings(data_dir=tmp_path, analysis_fps=1, sam2_frame_stride=1),
+        provider=provider,
+    )
+
+    with pytest.raises(VisionUnavailable, match="incomplete or mismatched"):
+        analyzer.analyze_annotated(
+            frame_dir,
+            frame_count=2,
+            job_id="incomplete",
+            annotations=[
+                PartAnnotation(name="panel", frameIndex=1, points=[PointPrompt(x=1, y=1)]),
+                PartAnnotation(name="axle", frameIndex=1, points=[PointPrompt(x=2, y=2)]),
+            ],
+        )
+
+
+def test_sam2_cuda_oom_is_reported_without_sequential_retry(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    class OomProvider(SamplingSam2Provider):
+        device = SimpleNamespace(type="cuda")
+
+        def init_state(self, frame_dir: str) -> object:
+            self.state_count += 1
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+    provider = OomProvider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    (frame_dir / "frame-0000.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=tmp_path), provider=provider)
+
+    with pytest.raises(AppError) as error:
+        analyzer.analyze_annotated(
+            frame_dir,
+            frame_count=1,
+            job_id="oom",
+            annotations=[PartAnnotation(name="panel", frameIndex=0, points=[PointPrompt(x=1, y=1)])],
+        )
+
+    assert error.value.code == "SAM2_CUDA_OUT_OF_MEMORY"
+    assert provider.state_count == 1
+
+
+def test_sam2_target_rate_scales_with_extraction_fps_and_keeps_required_frames(tmp_path: Path) -> None:
+    analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=tmp_path, analysis_fps=5, sam2_tracking_fps=0.5))
+
+    indices = analyzer._sampled_source_indices(
+        21,
+        [PartAnnotation(name="panel", frameIndex=7, points=[PointPrompt(x=1, y=1)])],
+    )
+
+    assert analyzer.settings.resolved_sam2_frame_stride() == 10
+    assert indices == [0, 7, 10, 20]
+
+
+def test_sam2_uses_snapshot_frame_metadata_for_source_paths_and_events(tmp_path: Path) -> None:
+    provider = SamplingSam2Provider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    frames = [
+        Frame(frameId="snapshot-00000000", timestampSeconds=0, imageUrl="/snapshot/0"),
+        Frame(frameId="snapshot-00004800", timestampSeconds=4.8, imageUrl="/snapshot/4.8"),
+        Frame(frameId="snapshot-00010000", timestampSeconds=10, imageUrl="/snapshot/10"),
+    ]
+    for frame in frames:
+        (frame_dir / f"{frame.frameId}.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=tmp_path, sam2_frame_stride=1), provider=provider)
+
+    result = analyzer.analyze_annotated(
+        frame_dir,
+        frame_count=3,
+        job_id="snapshots",
+        annotations=[PartAnnotation(name="panel", frameIndex=2, points=[PointPrompt(x=1, y=1)])],
+        source_frames=frames,
+    )
+
+    assert provider.loaded_frame_names == ["000000.jpg", "000001.jpg", "000002.jpg"]
+    assert result.tracks[0].lastTimestampSeconds == 10
+
+    observations = [
+        TrackObservation(frameIndex=index, bbox=(0, 0, 10, 10), centroid=(0, 0), visible=True)
+        for index in range(3)
+    ]
+    events = analyzer._events_from_part_tracks([
+        PartTrack(partId=1, name="panel", observations=observations, attachmentStartFrame=2, attachmentEndFrame=1),
+    ], frames)
+    assert [(event.beforeFrameId, event.afterFrameId) for event in events] == [
+        ("snapshot-00010000", "snapshot-00004800"),
+    ]
 
 
 def test_sam2_analyzer_reuses_the_loaded_provider_between_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

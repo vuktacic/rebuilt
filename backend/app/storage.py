@@ -6,10 +6,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobResponse, JobStatus, PartAnnotation, PartTrack, TrackSummary
+from .models import AnalysisEvent, AnalysisInfo, AnnotationSuggestionResult, Frame, Guide, JobError, JobResponse, JobStatus, PartAnnotation, PartTrack, TrackSummary
 
 
-ACTIVE_STATUSES = {"queued", "extracting", "analyzing", "generating"}
+ACTIVE_STATUSES = {"queued", "extracting", "suggesting", "analyzing", "generating"}
 
 
 class JobRepository:
@@ -36,8 +36,21 @@ class JobRepository:
         suffix = Path(filename).suffix.lower() or ".upload"
         return self._job_dir(job_id) / "input" / f"video{suffix}"
 
+    def source_filename(self, job_id: str) -> str | None:
+        path = self._job_dir(job_id) / "metadata.json"
+        if not path.is_file():
+            return None
+        with self._lock:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        filename = raw.get("filename")
+        return filename if isinstance(filename, str) else None
+
     def frame_path(self, job_id: str, frame_id: str) -> Path:
         return self._job_dir(job_id) / "frames" / f"{frame_id}.jpg"
+
+    def uploaded_video_path(self, job_id: str) -> Path | None:
+        input_dir = self._job_dir(job_id) / "input"
+        return next((path for path in input_dir.iterdir() if path.is_file()), None) if input_dir.is_dir() else None
 
     def get(self, job_id: str) -> JobResponse | None:
         path = self._job_dir(job_id) / "metadata.json"
@@ -55,6 +68,7 @@ class JobRepository:
         frames: list[Frame] | None = None,
         tracks: list[TrackSummary] | None = None,
         annotations: list[PartAnnotation] | None = None,
+        annotation_suggestions: AnnotationSuggestionResult | None = None,
         part_tracks: list[PartTrack] | None = None,
         tracking_progress: float | None = None,
         events: list[AnalysisEvent] | None = None,
@@ -71,6 +85,7 @@ class JobRepository:
                 "frames": frames if frames is not None else current.frames,
                 "tracks": tracks if tracks is not None else current.tracks,
                 "annotations": annotations if annotations is not None else current.annotations,
+                "annotationSuggestions": annotation_suggestions if annotation_suggestions is not None else current.annotationSuggestions,
                 "partTracks": part_tracks if part_tracks is not None else current.partTracks,
                 "trackingProgress": tracking_progress if tracking_progress is not None else current.trackingProgress,
                 "events": events if events is not None else current.events,
@@ -80,7 +95,11 @@ class JobRepository:
             }
         )
         directory = self._job_dir(job_id)
-        self._write_json(directory / "metadata.json", updated.model_dump())
+        payload = updated.model_dump()
+        filename = self.source_filename(job_id)
+        if filename is not None:
+            payload["filename"] = filename
+        self._write_json(directory / "metadata.json", payload)
         if guide is not None:
             self._write_json(directory / "guide.json", guide.model_dump())
         return updated

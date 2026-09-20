@@ -174,6 +174,7 @@ h1 em { color: var(--orange); font-family: "Iowan Old Style", "Palatino Linotype
 .annotation-stage img { display: block; width: 100%; min-height: 260px; object-fit: contain; }
 .annotation-markers { position: absolute; inset: 0; pointer-events: none; }
 .annotation-point { position: absolute; width: 14px; height: 14px; border: 2px solid #fff; border-radius: 50%; background: var(--orange); box-shadow: 0 0 0 2px rgba(23,26,32,.65); transform: translate(-50%, -50%); }
+.annotation-point.suggestion { background: var(--blue); }
 .annotation-box { position: absolute; border: 2px solid var(--orange); border-radius: 4px; background: rgba(245,107,63,.08); }
 .annotation-box span { position: absolute; top: -21px; left: -2px; border-radius: 4px; padding: 3px 5px; color: #fff; background: var(--ink); font-size: .58rem; white-space: nowrap; }
 .annotation-controls { display: grid; align-content: start; gap: 12px; }

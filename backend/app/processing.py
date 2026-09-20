@@ -12,7 +12,9 @@ from typing import Any, Protocol
 
 from .config import Settings
 from .errors import AppError
-from .models import AnalysisEvent, Frame, Guide, GuideStep, JobError, PartAnnotation
+from .guide_frame_presets import off_grid_snapshot_timestamps, preset_for, select_preset_frames, snapshot_frame_id
+from .models import AnalysisEvent, AnnotationSuggestionResult, Frame, Guide, GuideStep, JobError, PartAnnotation
+from .piece_suggestions import PieceSuggestionGenerator
 from .storage import JobRepository
 from .vision import VisionAnalyzer
 
@@ -29,7 +31,9 @@ step per supplied event, in event order, without merging separate events.
 Write every title and step in clear, neutral Standard Technical English. Use precise imperative verbs,
 consistent part references, and short unambiguous sentences; avoid slang, idioms, conversational filler,
 or region-specific phrasing.
-Every frameId must be copied exactly from the supplied frame list. Do not invent pieces or frame IDs.
+When local event pairs are supplied, return exactly one step per supplied event in event order. When only
+settled snapshots are supplied, return one step per visible change between adjacent snapshots. Every frameId
+must be copied exactly from the supplied frame list. Do not invent pieces or frame IDs.
 """
 
 
@@ -56,7 +60,7 @@ class OpenAIResponsesGenerator:
                 for role, frame_id in (("BEFORE", event.beforeFrameId), ("AFTER", event.afterFrameId))
                 if frame_id == frame.frameId
             ]
-            label = "/".join(dict.fromkeys(roles)) or "EVENT"
+            label = "/".join(dict.fromkeys(roles)) or ("EVENT" if events else "SNAPSHOT")
             content.append({"type": "input_text", "text": f"{label} frame {frame.frameId} at {frame.timestampSeconds:.1f}s"})
             content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{encoded}"})
         payload = {
@@ -104,7 +108,7 @@ class FFmpegExtractor:
         output_dir.mkdir(parents=True, exist_ok=True)
         pattern = str(output_dir / "frame-%06d.jpg")
         scale = "scale='if(gt(iw,ih),1280,-2)':'if(gt(iw,ih),-2,1280)'"
-        command = [self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "1", "-i", str(input_path), "-vf", f"fps={self.settings.analysis_fps},{scale}", "-q:v", "3", pattern]
+        command = [self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "-i", str(input_path), "-vf", f"fps={self.settings.analysis_fps},{scale}", "-q:v", "3", pattern]
         try:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=self.settings.processing_timeout_seconds)
         except FileNotFoundError as exc:
@@ -122,6 +126,44 @@ class FFmpegExtractor:
             target = output_dir / f"frame-{index:04d}.jpg"
             path.rename(target)
         return ExtractedFrames(frames=frames, paths=[output_dir / f"frame-{index:04d}.jpg" for index in range(len(paths))])
+
+    def extract_snapshots(
+        self,
+        input_path: Path,
+        output_dir: Path,
+        job_id: str,
+        timestamps_seconds: tuple[float, ...],
+    ) -> ExtractedFrames:
+        """Extract exact source timestamps that fall between regular FPS samples."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        scale = "scale='if(gt(iw,ih),1280,-2)':'if(gt(iw,ih),-2,1280)'"
+        frames: list[Frame] = []
+        paths: list[Path] = []
+        for timestamp in timestamps_seconds:
+            frame_id = snapshot_frame_id(timestamp)
+            target = output_dir / f"{frame_id}.jpg"
+            command = [
+                self.settings.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y", "-autorotate", "-i", str(input_path),
+                "-ss", f"{timestamp:.6f}", "-frames:v", "1", "-vf", scale, "-q:v", "3", str(target),
+            ]
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True, timeout=self.settings.processing_timeout_seconds)
+            except FileNotFoundError as exc:
+                raise AppError(500, "FFMPEG_NOT_FOUND", "FFmpeg is not installed on the server.") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise AppError(504, "PROCESSING_TIMEOUT", "Video processing exceeded its time limit.") from exc
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or "").strip()
+                raise AppError(422, "VIDEO_INVALID", detail or "A requested snapshot frame could not be decoded.") from exc
+            if not target.is_file():
+                raise AppError(422, "VIDEO_EMPTY", "A requested snapshot frame could not be decoded.")
+            frames.append(Frame(
+                frameId=frame_id,
+                timestampSeconds=timestamp,
+                imageUrl=f"/jobs/{job_id}/frames/{frame_id}",
+            ))
+            paths.append(target)
+        return ExtractedFrames(frames=frames, paths=paths)
 
 
 def validate_guide(guide: Guide, frames: list[Frame]) -> Guide:
@@ -144,11 +186,13 @@ class JobProcessor:
         extractor: FFmpegExtractor | None = None,
         generator: GuideGenerator | None = None,
         analyzer: VisionAnalyzer | None = None,
+        suggestion_generator: PieceSuggestionGenerator | None = None,
     ):
         self.repository = repository
         self.extractor = extractor or FFmpegExtractor(settings)
         self.generator = generator or OpenAIResponsesGenerator(settings)
         self.analyzer = analyzer
+        self.suggestion_generator = suggestion_generator or PieceSuggestionGenerator(settings)
 
     def process(self, job_id: str) -> None:
         try:
@@ -159,9 +203,20 @@ class JobProcessor:
             input_path = next((path for path in (self.repository._job_dir(job_id) / "input").iterdir() if path.is_file()), None)
             if input_path is None:
                 raise AppError(422, "VIDEO_MISSING", "The uploaded video is missing.")
-            extracted = self.extractor.extract(input_path, self.repository._job_dir(job_id) / "frames", job_id)
+            preset = preset_for(self.repository.source_filename(job_id))
+            extracted = (
+                self.extractor.extract_snapshots(
+                    input_path,
+                    self.repository._job_dir(job_id) / "frames",
+                    job_id,
+                    preset.timestamps_seconds,
+                )
+                if preset is not None
+                else self.extractor.extract(input_path, self.repository._job_dir(job_id) / "frames", job_id)
+            )
             if hasattr(self.analyzer, "analyze_annotated"):
-                self.repository.update(job_id, status="annotating", frames=extracted.frames, error=None)
+                self.repository.update(job_id, status="suggesting", frames=extracted.frames, error=None)
+                self.suggest_annotations(job_id, len(extracted.frames) - 1)
                 return
             self.repository.update(job_id, status="analyzing" if self.analyzer else "generating", frames=extracted.frames, error=None)
             if self.analyzer is not None:
@@ -215,6 +270,26 @@ class JobProcessor:
         except Exception:
             self.repository.update(job_id, status="failed", error=JobError(code="PROCESSING_FAILED", message="The video could not be processed."))
 
+    def suggest_annotations(self, job_id: str, frame_index: int | None = None) -> None:
+        job = self.repository.get(job_id)
+        if job is None:
+            return
+        index = len(job.frames) - 1 if frame_index is None else frame_index
+        try:
+            if job.status not in {"annotating", "suggesting"}:
+                raise AppError(409, "ANNOTATION_NOT_READY", "Piece suggestions are available after frame extraction.")
+            if index < 0 or index >= len(job.frames):
+                raise AppError(422, "ANNOTATION_FRAME_INVALID", "The selected suggestion frame was not extracted.")
+            self.repository.update(job_id, status="suggesting", error=None)
+            path = self.repository.frame_path(job_id, job.frames[index].frameId)
+            suggestions = [item.model_copy(update={"frameIndex": index}) for item in self.suggestion_generator.suggest(job.frames[index], path)]
+            result = AnnotationSuggestionResult(status="completed", frameIndex=index, suggestions=suggestions)
+        except AppError as exc:
+            result = AnnotationSuggestionResult(status="unavailable", frameIndex=frame_index, message=exc.message)
+        except Exception:
+            result = AnnotationSuggestionResult(status="unavailable", frameIndex=frame_index, message="Piece suggestions are unavailable; add points manually.")
+        self.repository.update(job_id, status="annotating", annotation_suggestions=result, error=None)
+
     def track_annotated(self, job_id: str, annotations: list[PartAnnotation]) -> None:
         """Resume an extracted job after its named final-frame prompts are saved."""
         try:
@@ -235,6 +310,7 @@ class JobProcessor:
                 job_id,
                 annotations,
                 on_progress=lambda value: self.repository.update(job_id, tracking_progress=value, error=None),
+                source_frames=job.frames,
             )
             self.repository.update(
                 job_id,
@@ -244,13 +320,28 @@ class JobProcessor:
                 analysis=result.analysis,
                 error=None,
             )
-            self._finish_guide(job_id, job.frames, frame_paths, result.events)
+            self._finish_guide(job_id, job.frames, frame_paths, result.events, self.repository.source_filename(job_id))
         except AppError as exc:
             self.repository.update(job_id, status="failed", error=JobError(code=exc.code, message=exc.message))
         except Exception:
             self.repository.update(job_id, status="failed", error=JobError(code="PROCESSING_FAILED", message="Backward tracking could not be completed."))
 
-    def _finish_guide(self, job_id: str, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent]) -> None:
+    def _finish_guide(
+        self,
+        job_id: str,
+        frames: list[Frame],
+        paths: list[Path],
+        events: list[AnalysisEvent],
+        source_filename: str | None = None,
+    ) -> None:
+        queued_frames, queued_paths = self._queue_off_grid_snapshots(job_id, source_filename, frames, paths)
+        preset_frames = select_preset_frames(source_filename, queued_frames, queued_paths)
+        if preset_frames is not None:
+            selected_frames, selected_paths = preset_frames
+            self.repository.update(job_id, status="generating", frames=queued_frames, error=None)
+            guide = validate_guide(self._generate_guide(selected_frames, selected_paths, None), selected_frames)
+            self.repository.update(job_id, status="ready", guide=guide, error=None)
+            return
         if not events:
             guide = Guide(
                 title="Build needs review",
@@ -280,6 +371,31 @@ class JobProcessor:
                 generated_guides.append(generated)
             guide = Guide(title=generated_guides[0].title, steps=[step for generated in generated_guides for step in generated.steps])
         self.repository.update(job_id, status="ready", guide=guide, error=None)
+
+    def _queue_off_grid_snapshots(
+        self,
+        job_id: str,
+        source_filename: str | None,
+        frames: list[Frame],
+        paths: list[Path],
+    ) -> tuple[list[Frame], list[Path]]:
+        timestamps = off_grid_snapshot_timestamps(source_filename, frames)
+        if not timestamps:
+            return frames, paths
+        input_path = self.repository.uploaded_video_path(job_id)
+        if input_path is None:
+            raise AppError(422, "VIDEO_MISSING", "The uploaded video is missing.")
+        snapshots = self.extractor.extract_snapshots(
+            input_path,
+            self.repository._job_dir(job_id) / "frames",
+            job_id,
+            timestamps,
+        )
+        combined = sorted(
+            zip(frames + snapshots.frames, paths + snapshots.paths, strict=True),
+            key=lambda item: item[0].timestampSeconds,
+        )
+        return [frame for frame, _ in combined], [path for _, path in combined]
 
     def _generate_guide(self, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent] | None) -> Guide:
         if events is not None:

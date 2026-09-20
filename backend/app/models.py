@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-JobStatus = Literal["queued", "extracting", "annotating", "analyzing", "generating", "ready", "failed"]
+JobStatus = Literal["queued", "extracting", "suggesting", "annotating", "analyzing", "generating", "ready", "failed"]
 EventKind = Literal["attach", "detach", "uncertain_change"]
 TrackVisibility = Literal["visible", "occluded", "lost"]
 TrackMembership = Literal["separate", "attached", "unknown"]
@@ -29,6 +29,24 @@ class TrackSummary(BaseModel):
 class PointPrompt(BaseModel):
     x: float = Field(ge=0)
     y: float = Field(ge=0)
+
+
+class AnnotationSuggestionRequest(BaseModel):
+    frameIndex: int | None = Field(default=None, ge=0)
+
+
+class AnnotationSuggestion(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    frameIndex: int = Field(ge=0)
+    point: PointPrompt
+    confidence: float = Field(ge=0, le=1)
+
+
+class AnnotationSuggestionResult(BaseModel):
+    status: Literal["completed", "unavailable", "pending"]
+    frameIndex: int | None = Field(default=None, ge=0)
+    suggestions: list[AnnotationSuggestion] = Field(default_factory=list)
+    message: str | None = None
 
 
 class PartAnnotation(BaseModel):
@@ -104,6 +122,7 @@ class JobResponse(BaseModel):
     frames: list[Frame] = Field(default_factory=list)
     tracks: list[TrackSummary] = Field(default_factory=list)
     annotations: list[PartAnnotation] = Field(default_factory=list)
+    annotationSuggestions: AnnotationSuggestionResult | None = None
     partTracks: list[PartTrack] = Field(default_factory=list)
     trackingProgress: float | None = Field(default=None, ge=0, le=1)
     events: list[AnalysisEvent] = Field(default_factory=list)

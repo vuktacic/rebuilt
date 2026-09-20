@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Settings, VisionRuntimeError
 from .errors import AppError, error_payload
-from .models import AnnotationRequest, Guide, JobCreated, JobResponse
+from .models import AnnotationRequest, AnnotationSuggestionRequest, Guide, JobCreated, JobResponse
 from .processing import JobProcessor, validate_guide
 from .storage import ACTIVE_STATUSES, JobRepository
 from .vision import NoopVisionAnalyzer, create_vision_analyzer, validate_vision_runtime
@@ -58,6 +58,20 @@ class JobCoordinator:
                         self._active_job_id = None
 
         threading.Thread(target=run, name=f"rebuilt-track-{job_id}", daemon=True).start()
+
+    def suggest_annotations(self, job_id: str, frame_index: int | None) -> None:
+        with self._lock:
+            self._active_job_id = job_id
+
+        def run() -> None:
+            try:
+                self.processor.suggest_annotations(job_id, frame_index)
+            finally:
+                with self._lock:
+                    if self._active_job_id == job_id:
+                        self._active_job_id = None
+
+        threading.Thread(target=run, name=f"rebuilt-suggest-{job_id}", daemon=True).start()
 
     def busy(self) -> bool:
         with self._lock:
@@ -169,6 +183,20 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
         if any(not annotation.points and annotation.box is None for annotation in request.annotations):
             raise AppError(422, "ANNOTATION_INVALID", "Each part needs a point or bounding box prompt.")
         return repository.update(job_id, annotations=request.annotations, error=None)
+
+    @app.post("/jobs/{job_id}/annotation-suggestions", response_model=JobResponse, status_code=202)
+    async def suggest_annotations(job_id: str, request: AnnotationSuggestionRequest | None = None) -> JobResponse:
+        if not SAFE_ID.fullmatch(job_id):
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        job = repository.get(job_id)
+        if job is None:
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        if job.status != "annotating":
+            raise AppError(409, "ANNOTATION_NOT_READY", "Piece suggestions are available after frame extraction.")
+        if coordinator.busy():
+            raise AppError(409, "PROCESSING_BUSY", "Another analysis operation is currently running.")
+        coordinator.suggest_annotations(job_id, request.frameIndex if request else None)
+        return repository.get(job_id) or job
 
     @app.post("/jobs/{job_id}/track", response_model=JobResponse, status_code=202)
     async def track_backward(job_id: str) -> JobResponse:

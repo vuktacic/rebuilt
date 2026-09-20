@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import platform
 import re
@@ -147,7 +148,8 @@ class Settings:
     vision_worker: bool = True
     sam2_checkpoint: Path | None = None
     sam2_model_config: str = "configs/sam2.1/sam2.1_hiera_s.yaml"
-    sam2_frame_stride: int = 2
+    sam2_tracking_fps: float = 0.5
+    sam2_frame_stride: int | None = None
     sam2_apply_postprocessing: bool = False
     sam2_vos_optimized: bool = False
     sam2_mlx_model_id: str = "avbiswas/sam2.1-hiera-small-mlx"
@@ -160,6 +162,14 @@ class Settings:
     mlx_image_size: int = 336
     mlx_frame_stride: int = 2
     fixture_report_dir: Path = Path("reports")
+
+    def resolved_sam2_frame_stride(self) -> int:
+        """Translate the requested SAM2 rate into extracted-frame steps."""
+        if self.sam2_frame_stride is not None:
+            return max(1, self.sam2_frame_stride)
+        if self.analysis_fps <= 0 or self.sam2_tracking_fps <= 0:
+            raise ValueError("REBUILT_ANALYSIS_FPS and SAM2_TRACKING_FPS must be greater than zero.")
+        return max(1, math.ceil(self.analysis_fps / self.sam2_tracking_fps))
 
     @classmethod
     def from_env(cls, data_dir: Path | None = None) -> "Settings":
@@ -176,6 +186,7 @@ class Settings:
         local_sam2_checkpoint = project_root / ".models" / "sam2" / "sam2.1_hiera_small.pt"
         configured_dir = data_dir or Path(os.getenv("REBUILT_DATA_DIR", ".data"))
         configured_checkpoint = os.getenv("SAM3_CHECKPOINT")
+        configured_sam2_stride = os.getenv("SAM2_FRAME_STRIDE")
         return cls(
             data_dir=configured_dir,
             max_upload_bytes=int(os.getenv("REBUILT_MAX_UPLOAD_BYTES", 250 * 1024 * 1024)),
@@ -200,7 +211,8 @@ class Settings:
             vision_worker=os.getenv("REBUILT_VISION_WORKER", "1").lower() not in {"0", "false", "no"},
             sam2_checkpoint=Path(os.environ["SAM2_CHECKPOINT"]) if os.getenv("SAM2_CHECKPOINT") else (local_sam2_checkpoint if local_sam2_checkpoint.is_file() else None),
             sam2_model_config=os.getenv("SAM2_MODEL_CONFIG", "configs/sam2.1/sam2.1_hiera_s.yaml"),
-            sam2_frame_stride=max(1, int(os.getenv("SAM2_FRAME_STRIDE", "2"))),
+            sam2_tracking_fps=float(os.getenv("SAM2_TRACKING_FPS", "0.5")),
+            sam2_frame_stride=max(1, int(configured_sam2_stride)) if configured_sam2_stride else None,
             sam2_apply_postprocessing=os.getenv("SAM2_APPLY_POSTPROCESSING", "0").lower() in {"1", "true", "yes"},
             sam2_vos_optimized=os.getenv("SAM2_VOS_OPTIMIZED", "0").lower() in {"1", "true", "yes"},
             sam2_mlx_model_id=os.getenv("SAM2_MLX_MODEL_ID", "avbiswas/sam2.1-hiera-small-mlx"),

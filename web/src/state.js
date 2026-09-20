@@ -11,6 +11,7 @@ export function initialState(mode = "live") {
     frames: [],
     tracks: [],
     annotations: [],
+    annotationSuggestions: null,
     partTracks: [],
     trackingProgress: null,
     events: [],
@@ -47,6 +48,7 @@ export function reduce(state, action) {
         frames: copy(job.frames || []),
         tracks: copy(job.tracks || []),
         annotations: copy(job.annotations || []),
+        annotationSuggestions: job.annotationSuggestions ? copy(job.annotationSuggestions) : null,
         partTracks: copy(job.partTracks || []),
         trackingProgress: job.trackingProgress ?? null,
         events: copy(job.events || []),
@@ -68,6 +70,7 @@ export function reduce(state, action) {
         frames: copy(job.frames || []),
         tracks: copy(job.tracks || []),
         annotations: copy(job.annotations || []),
+        annotationSuggestions: job.annotationSuggestions ? copy(job.annotationSuggestions) : null,
         partTracks: copy(job.partTracks || []),
         trackingProgress: job.trackingProgress ?? null,
         events: copy(job.events || []),
@@ -101,6 +104,17 @@ export function reduce(state, action) {
       return { ...state, isSaving: true, saveError: null };
     case "SAVE_SUCCEEDED":
       return { ...state, guide: copy(action.guide), draftGuide: copy(action.guide), dirty: false, isSaving: false, saveError: null };
+    case "ACCEPT_SUGGESTIONS": {
+      const existing = new Set(state.annotations.map((item) => item.name.trim().toLowerCase()));
+      const additions = (state.annotationSuggestions?.suggestions || [])
+        .filter((item) => !existing.has(item.name.trim().toLowerCase()))
+        .map((item) => ({ name: item.name, frameIndex: item.frameIndex, points: [item.point], labels: [1] }));
+      return { ...state, annotations: [...state.annotations, ...additions], annotationSuggestions: null };
+    }
+    case "EDIT_ANNOTATION_NAME":
+      return { ...state, annotations: state.annotations.map((item, index) => index === action.index ? { ...item, name: action.value } : item) };
+    case "DELETE_ANNOTATION":
+      return { ...state, annotations: state.annotations.filter((_, index) => index !== action.index) };
     case "SAVE_FAILED":
       return { ...state, isSaving: false, saveError: action.error };
     default:
@@ -127,6 +141,7 @@ export function statusMessage(state) {
   if (state.phase === "uploading") return "Uploading your recording…";
   if (state.status === "queued") return "Waiting to start…";
   if (state.status === "extracting") return "Selecting useful frames…";
+  if (state.status === "suggesting") return "GPT is suggesting brick names and points…";
   if (state.status === "annotating") return "Name visible parts on the final frame…";
   if (state.status === "analyzing") return "Tracking named parts backward through the video…";
   if (state.status === "generating") return "Writing the assembly guide…";

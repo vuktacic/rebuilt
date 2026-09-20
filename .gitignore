@@ -16,3 +16,6 @@ reports/
 .env
 .env.*
 !.env.example
+.venv
+.venv-sam2
+.venv-sam3

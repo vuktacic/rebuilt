@@ -67,3 +67,30 @@ test("status messages distinguish processing and unsaved review", () => {
   state = reduce(state, { type: "EDIT_TITLE", value: "Changed" });
   assert.equal(statusMessage(state), "Unsaved edits");
 });
+
+test("suggestions can be accepted without duplicating an existing approved name", () => {
+  let state = reduce(initialState(), {
+    type: "JOB_UPDATE",
+    job: {
+      jobId: "job-1",
+      status: "annotating",
+      frames,
+      annotations: [{ name: "red brick", frameIndex: 1, points: [{ x: 1, y: 2 }], labels: [1] }],
+      annotationSuggestions: {
+        status: "completed",
+        frameIndex: 1,
+        suggestions: [
+          { name: "red brick", frameIndex: 1, point: { x: 3, y: 4 }, confidence: 0.8 },
+          { name: "blue plate", frameIndex: 1, point: { x: 5, y: 6 }, confidence: 0.9 },
+        ],
+        message: null,
+      },
+      guide: null,
+      error: null,
+    },
+  });
+  state = reduce(state, { type: "ACCEPT_SUGGESTIONS" });
+  assert.deepEqual(state.annotations.map((item) => item.name), ["red brick", "blue plate"]);
+  assert.equal(state.annotations[1].points[0].x, 5);
+  assert.equal(state.annotationSuggestions, null);
+});

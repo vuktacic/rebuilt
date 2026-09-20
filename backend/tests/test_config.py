@@ -62,8 +62,15 @@ def test_mlx_fast_profile_defaults_to_a_small_image_size_and_samples_every_other
     assert settings.mlx_frame_stride == 2
 
 
-def test_sam2_fast_profile_samples_every_other_extracted_frame(tmp_path: Path) -> None:
+def test_sam2_fast_profile_targets_half_a_frame_per_second(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path)
 
-    assert settings.sam2_frame_stride == 2
+    assert settings.sam2_tracking_fps == 0.5
+    assert settings.resolved_sam2_frame_stride() == 4
     assert settings.sam2_apply_postprocessing is False
+
+
+def test_sam2_exact_frame_stride_remains_an_override(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, analysis_fps=5, sam2_tracking_fps=0.5, sam2_frame_stride=3)
+
+    assert settings.resolved_sam2_frame_stride() == 3

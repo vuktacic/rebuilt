@@ -39,8 +39,10 @@ uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
 The server stores uploads and generated frames under `.data/` by default. Set
-`REBUILT_DATA_DIR` to use a separate runtime directory. `OPENAI_MODEL` defaults
-to `gpt-5.4`; credentials remain server-side. The API is documented in
+`REBUILT_DATA_DIR` to use a separate runtime directory. `.env` is the single
+runtime configuration file: `OPENAI_MODEL` selects the model used for both
+piece suggestions and guide generation, and defaults to `gpt-5.4`. Credentials
+remain server-side. The API is documented in
 [`contracts/README.md`](contracts/README.md).
 
 For a quick request, upload a supported video as the `video` multipart field:
@@ -119,12 +121,24 @@ local analysis time materially.
 
 ### Fast manual SAM2 reverse tracking on Apple Silicon
 
-The default `sam2` backend now uses a fast temporal profile: it propagates
-every other extracted frame, always includes saved annotation frames and the
-final frame, then restores source-frame IDs in the review track. This reduces
-the default model work by about half while keeping the UI and guide references
-in original video coordinates. Set `SAM2_FRAME_STRIDE=1` for maximum temporal
-detail.
+The default `sam2` backend now targets 0.5 processed frames per second. Set
+`SAM2_TRACKING_FPS` in `.env` to trade temporal detail for speed. SAM2 converts
+that rate into a stride over `REBUILT_ANALYSIS_FPS`, always includes saved
+annotation frames and the final frame, then restores source-frame IDs in the
+review track. For example, extraction at 5 FPS with `SAM2_TRACKING_FPS=0.5`
+processes every tenth frame. On CUDA, all named parts share one SAM2 inference
+state so the video features and propagation pass are reused across objects.
+MPS, MLX, and CPU retain isolated one-object states because those runtimes have
+different prompt-memory constraints. `SAM2_FRAME_STRIDE` remains an advanced
+backwards-compatible override when an exact stride is required. CUDA
+out-of-memory conditions are reported explicitly instead of silently switching
+to the slower path.
+
+The four configured demo recordings (`IMG_3320.MOV`, `IMG_3325.MOV`,
+`IMG_3327.MOV`, and `IMG_3330.MOV`) skip regular FPS extraction entirely. Their
+jobs extract and track only the source timestamps in
+`backend/app/guide_frame_presets.py`; other uploads retain the normal automatic
+extraction path.
 
 For a native MLX implementation of the same manual backward-tracking workflow,
 use the separate pinned runtime:

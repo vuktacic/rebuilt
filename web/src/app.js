@@ -38,6 +38,8 @@ const elements = {
   annotationFrameLabel: document.querySelector("#annotation-frame-label"),
   annotationName: document.querySelector("#annotation-name"),
   annotationHint: document.querySelector("#annotation-hint"),
+  suggestAnnotationsButton: document.querySelector("#suggest-annotations-button"),
+  suggestionList: document.querySelector("#suggestion-list"),
   addAnnotationButton: document.querySelector("#add-annotation-button"),
   annotationList: document.querySelector("#annotation-list"),
   trackBackwardButton: document.querySelector("#track-backward-button"),
@@ -121,23 +123,63 @@ function renderAnnotation() {
   }
   elements.annotationFrameLabel.textContent = `${frame.frameId} · ${formatTime(frame.timestampSeconds)}`;
   elements.annotationMarkers.replaceChildren();
-  [...state.annotations, ...(selectedAnnotationPoint ? [{ name: "new", frameIndex: Number(elements.annotationFrame.value), points: [selectedAnnotationPoint] }] : [])]
-    .filter((item) => item.frameIndex === Number(elements.annotationFrame.value)).forEach((item) => {
+  const frameIndex = Number(elements.annotationFrame.value);
+  const markers = [
+    ...state.annotations.map((item) => ({ item, suggestion: false })),
+    ...(state.annotationSuggestions?.suggestions || []).map((item) => ({ item: { ...item, points: [item.point] }, suggestion: true })),
+    ...(selectedAnnotationPoint ? [{ item: { name: "new", frameIndex, points: [selectedAnnotationPoint] }, suggestion: false }] : []),
+  ];
+  markers.filter(({ item }) => item.frameIndex === frameIndex).forEach(({ item, suggestion }) => {
       const point = item.points[0];
       if (!point) return;
       const marker = document.createElement("i");
-      marker.className = "annotation-point";
+      marker.className = `annotation-point${suggestion ? " suggestion" : ""}`;
       marker.style.left = `${point.x / elements.annotationImage.naturalWidth * 100}%`;
       marker.style.top = `${point.y / elements.annotationImage.naturalHeight * 100}%`;
       elements.annotationMarkers.append(marker);
     });
+  elements.suggestAnnotationsButton.disabled = false;
   elements.addAnnotationButton.disabled = !selectedAnnotationPoint || !elements.annotationName.value.trim();
   elements.trackBackwardButton.disabled = state.annotations.length === 0;
-  elements.annotationList.replaceChildren(...state.annotations.map((item) => {
-    const line = document.createElement("p");
-    line.textContent = `${item.name} · frame ${item.frameIndex + 1}`;
+  elements.annotationList.replaceChildren(...state.annotations.map((item, index) => {
+    const line = document.createElement("div");
+    line.className = "annotation-list-row";
+    const name = document.createElement("input");
+    name.value = item.name;
+    name.setAttribute("aria-label", `Name for part ${index + 1}`);
+    name.addEventListener("input", (event) => dispatch({ type: "EDIT_ANNOTATION_NAME", index, value: event.target.value }));
+    const frame = document.createElement("small");
+    frame.textContent = `frame ${item.frameIndex + 1}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${item.name}`);
+    remove.addEventListener("click", () => dispatch({ type: "DELETE_ANNOTATION", index }));
+    line.append(name, frame, remove);
     return line;
   }));
+  elements.suggestionList.replaceChildren();
+  const suggestions = state.annotationSuggestions;
+  if (suggestions?.status === "unavailable") {
+    const line = document.createElement("p");
+    line.textContent = suggestions.message || "Suggestions are unavailable; add points manually.";
+    elements.suggestionList.append(line);
+  } else if (suggestions?.suggestions?.length) {
+    const line = document.createElement("p");
+    line.textContent = `${suggestions.suggestions.length} suggested part${suggestions.suggestions.length === 1 ? "" : "s"}. Review the blue points before accepting.`;
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.className = "button button-secondary";
+    accept.textContent = "Accept suggestions";
+    accept.addEventListener("click", () => dispatch({ type: "ACCEPT_SUGGESTIONS" }));
+    elements.suggestionList.append(line, accept);
+    suggestions.suggestions.forEach((suggestion) => {
+      const detail = document.createElement("p");
+      detail.textContent = `${suggestion.name} · ${Math.round(suggestion.confidence * 100)}% · (${Math.round(suggestion.point.x)}, ${Math.round(suggestion.point.y)})`;
+      elements.suggestionList.append(detail);
+    });
+  }
 }
 
 function renderTrackingPreview() {
@@ -315,11 +357,12 @@ function pillText(current) {
 function progressPercent(current) {
   if (current.phase === "uploading") return 18;
   if (current.status === "analyzing" && typeof current.trackingProgress === "number") return 55 + Math.round(current.trackingProgress * 29);
-  return { queued: 20, extracting: 40, annotating: 52, analyzing: 68, generating: 84, ready: 100, failed: 100 }[current.status] || 0;
+  return { queued: 20, extracting: 40, suggesting: 48, annotating: 52, analyzing: 68, generating: 84, ready: 100, failed: 100 }[current.status] || 0;
 }
 
 function detailText(current) {
   if (current.phase === "uploading") return `Uploading ${current.uploadName || "your video"}…`;
+  if (current.status === "suggesting") return "GPT is reviewing the final disassembled frame for visible brick names and points.";
   if (current.status === "annotating") return "Click and name every clearly separated part. The final frame is selected by default; use an earlier frame only as a fallback.";
   if (current.status === "analyzing" && typeof current.trackingProgress === "number") return `SAM2 is propagating masks backward: ${Math.round(current.trackingProgress * 100)}% complete. You can leave this tab open.`;
   if (current.phase === "processing") return "This page checks for progress every two seconds. You can leave this tab open.";
@@ -373,6 +416,20 @@ async function handleSave() {
     dispatch({ type: "SAVE_SUCCEEDED", guide });
   } catch (error) {
     dispatch({ type: "SAVE_FAILED", error: normalizeError(error) });
+  }
+}
+
+async function handleSuggestAnnotations() {
+  if (!state.jobId || state.status !== "annotating") return;
+  elements.suggestAnnotationsButton.disabled = true;
+  try {
+    const result = await api.suggestAnnotations(state.jobId, Number(elements.annotationFrame.value));
+    dispatch({ type: "JOB_UPDATE", job: result });
+    if (result.status !== "annotating") await beginPolling(state.jobId);
+  } catch (error) {
+    dispatch({ type: "UPLOAD_FAILED", error: normalizeError(error) });
+  } finally {
+    elements.suggestAnnotationsButton.disabled = false;
   }
 }
 
@@ -453,6 +510,7 @@ elements.saveButton.addEventListener("click", handleSave);
 elements.addStepButton.addEventListener("click", () => dispatch({ type: "ADD_STEP" }));
 elements.annotationFrame.addEventListener("input", () => { selectedAnnotationPoint = null; renderAnnotation(); });
 elements.annotationName.addEventListener("input", renderAnnotation);
+elements.annotationImage.addEventListener("load", renderAnnotation);
 elements.annotationImage.addEventListener("click", (event) => {
   const bounds = elements.annotationImage.getBoundingClientRect();
   selectedAnnotationPoint = {
@@ -462,6 +520,7 @@ elements.annotationImage.addEventListener("click", (event) => {
   renderAnnotation();
 });
 elements.addAnnotationButton.addEventListener("click", addAnnotation);
+elements.suggestAnnotationsButton.addEventListener("click", handleSuggestAnnotations);
 elements.trackBackwardButton.addEventListener("click", trackBackward);
 elements.trackingFrame.addEventListener("input", renderTrackingPreview);
 elements.trackingImage.addEventListener("load", renderTrackingPreview);

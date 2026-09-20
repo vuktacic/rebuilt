@@ -6,9 +6,11 @@
   "required": ["jobId", "status", "frames", "tracks", "events", "analysis", "guide", "error"],
   "properties": {
     "jobId": {"type": "string", "minLength": 1},
-    "status": {"enum": ["queued", "extracting", "analyzing", "generating", "ready", "failed"]},
+    "status": {"enum": ["queued", "extracting", "suggesting", "annotating", "analyzing", "generating", "ready", "failed"]},
     "frames": {"type": "array", "items": {"$ref": "#/$defs/frame"}},
     "tracks": {"type": "array", "items": {"$ref": "#/$defs/track"}},
+    "annotations": {"type": "array", "items": {"$ref": "#/$defs/annotation"}},
+    "annotationSuggestions": {"anyOf": [{"$ref": "#/$defs/annotationSuggestions"}, {"type": "null"}]},
     "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
     "analysis": {"anyOf": [{"$ref": "#/$defs/analysis"}, {"type": "null"}]},
     "guide": {"anyOf": [{"$ref": "#/$defs/guide"}, {"type": "null"}]},
@@ -35,6 +37,49 @@
         "lastTimestampSeconds": {"type": "number", "minimum": 0},
         "visibility": {"enum": ["visible", "occluded", "lost"]},
         "membership": {"enum": ["separate", "attached", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "point": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"type": "number", "minimum": 0},
+        "y": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "annotation": {
+      "type": "object",
+      "required": ["name", "frameIndex", "points", "labels", "box"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "frameIndex": {"type": "integer", "minimum": 0},
+        "points": {"type": "array", "items": {"$ref": "#/$defs/point"}},
+        "labels": {"type": "array", "items": {"type": "integer"}},
+        "box": {"anyOf": [{"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "annotationSuggestions": {
+      "type": "object",
+      "required": ["status", "frameIndex", "suggestions", "message"],
+      "properties": {
+        "status": {"enum": ["completed", "unavailable", "pending"]},
+        "frameIndex": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "suggestions": {"type": "array", "items": {"$ref": "#/$defs/suggestion"}},
+        "message": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "suggestion": {
+      "type": "object",
+      "required": ["name", "frameIndex", "point", "confidence"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "frameIndex": {"type": "integer", "minimum": 0},
+        "point": {"$ref": "#/$defs/point"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
       },
       "additionalProperties": false
     },

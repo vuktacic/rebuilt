@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from .config import Settings, resolve_vision_backend
 from .errors import AppError
-from .models import AnalysisEvent, AnalysisInfo, PartAnnotation, PartTrack, TrackObservation, TrackSummary
+from .models import AnalysisEvent, AnalysisInfo, Frame, PartAnnotation, PartTrack, TrackObservation, TrackSummary
 
 
 LOGGER = logging.getLogger(__name__)
@@ -86,6 +86,7 @@ class Sam2BackwardVisionAnalyzer:
         job_id: str,
         annotations: list[PartAnnotation],
         on_progress: Any | None = None,
+        source_frames: list[Frame] | None = None,
     ) -> AnalysisResult:
         if not annotations:
             raise AppError(422, "ANNOTATIONS_REQUIRED", "Add at least one named part prompt before tracking backward.")
@@ -95,10 +96,22 @@ class Sam2BackwardVisionAnalyzer:
         if self._provider is None:
             self._provider = self._load_provider()
         provider = self._provider
-        source_indices = self._sampled_source_indices(frame_count, annotations)
+        if source_frames is not None and len(source_frames) != frame_count:
+            raise AppError(422, "ANNOTATION_FRAME_INVALID", "Tracked frame metadata does not match the extracted frames.")
+        frame_metadata = source_frames or [
+            Frame(
+                frameId=f"frame-{index:04d}",
+                timestampSeconds=index / self.settings.analysis_fps,
+                imageUrl=f"/frames/frame-{index:04d}",
+            )
+            for index in range(frame_count)
+        ]
+        frame_stride = self.settings.resolved_sam2_frame_stride()
+        source_indices = self._sampled_source_indices(frame_count, annotations, frame_stride)
         source_to_sampled_index = {source_index: sampled_index for sampled_index, source_index in enumerate(source_indices)}
         object_ids: dict[str, int] = {}
         observations: dict[int, dict[int, TrackObservation]] = {}
+        prompts: list[tuple[int, PartAnnotation, list[list[float]] | None, list[int] | None]] = []
         for annotation_number, annotation in enumerate(annotations, start=1):
             name = annotation.name.strip()
             object_id = object_ids.setdefault(name, annotation_number)
@@ -109,36 +122,45 @@ class Sam2BackwardVisionAnalyzer:
                 raise AppError(422, "ANNOTATION_INVALID", "Each point prompt needs a matching foreground or background label.")
             if not points and annotation.box is None:
                 raise AppError(422, "ANNOTATION_INVALID", "Each part needs at least one point or a bounding box.")
-            with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
-                sam2_frame_dir = Path(temporary_dir)
-                source_frames = sorted(frame_dir.glob("frame-*.jpg"))
-                if len(source_frames) != frame_count:
-                    raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
-                for sampled_index, source_index in enumerate(source_indices):
-                    (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_frames[source_index].resolve())
-                # MPS can abort when SAM2 batches heterogeneous prompt memory.
-                # Independent one-object states avoid that backend limitation.
-                state = self._initialize_state(provider, sam2_frame_dir)
-                provider.add_new_points_or_box(
-                    state,
-                    frame_idx=source_to_sampled_index[annotation.frameIndex],
-                    obj_id=1,
-                    points=points,
-                    labels=labels,
-                    box=list(annotation.box) if annotation.box is not None else None,
-                    clear_old_points=False,
+            prompts.append((object_id, annotation, points, labels))
+
+        source_paths = [frame_dir / f"{frame.frameId}.jpg" for frame in frame_metadata]
+        if any(not path.is_file() for path in source_paths):
+            raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
+        with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
+            sam2_frame_dir = Path(temporary_dir)
+            for sampled_index, source_index in enumerate(source_indices):
+                (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_paths[source_index].resolve())
+            batched = self._supports_batched_objects(provider)
+            if batched:
+                try:
+                    self._analyze_batched(
+                        provider,
+                        sam2_frame_dir,
+                        source_indices,
+                        source_to_sampled_index,
+                        prompts,
+                        observations,
+                        on_progress,
+                    )
+                except Exception as exc:
+                    if self._is_cuda_out_of_memory(exc):
+                        raise AppError(
+                            503,
+                            "SAM2_CUDA_OUT_OF_MEMORY",
+                            "SAM2 ran out of CUDA memory while tracking all annotated parts together. Reduce the number of annotated parts or use a larger GPU.",
+                        ) from exc
+                    raise
+            else:
+                self._analyze_independently(
+                    provider,
+                    sam2_frame_dir,
+                    source_indices,
+                    source_to_sampled_index,
+                    prompts,
+                    observations,
+                    on_progress,
                 )
-                for processed, (frame_index, _returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
-                    state,
-                    start_frame_idx=len(source_indices) - 1,
-                    reverse=True,
-                ), start=1):
-                    if on_progress is not None:
-                        total = len(source_indices) * len(annotations)
-                        on_progress(min(1.0, ((annotation_number - 1) * len(source_indices) + processed) / total))
-                    source_index = source_indices[int(frame_index)]
-                    mask_for_object = self._mask_items(mask_logits)[0]
-                    observations[object_id][source_index] = self._observation(source_index, mask_for_object)
 
         tracks: list[PartTrack] = []
         for name, object_id in object_ids.items():
@@ -157,14 +179,14 @@ class Sam2BackwardVisionAnalyzer:
             )
             track.attachmentStartFrame = separate_frame
             track.attachmentEndFrame = attached_frame
-        events = self._events_from_part_tracks(tracks)
+        events = self._events_from_part_tracks(tracks, frame_metadata)
         elapsed = time.monotonic() - started
         summaries = [
             TrackSummary(
                 trackId=f"part:{track.partId}",
                 concept=track.name,
                 firstTimestampSeconds=0,
-                lastTimestampSeconds=max(0, frame_count - 1) / self.settings.analysis_fps,
+                lastTimestampSeconds=frame_metadata[-1].timestampSeconds,
                 visibility="visible" if any(item.visible for item in track.observations) else "lost",
                 membership="attached" if track.attachmentStartFrame is not None else "unknown",
             )
@@ -182,15 +204,109 @@ class Sam2BackwardVisionAnalyzer:
                 metrics={
                     "frames": float(frame_count),
                     "sampled_frames": float(len(source_indices)),
-                    "frame_stride": float(self.settings.sam2_frame_stride),
+                    "frame_stride": float(frame_stride),
+                    "tracking_fps": self.settings.analysis_fps / frame_stride,
                     "parts": float(len(tracks)),
                     "events": float(len(events)),
+                    "inference_states": 1.0 if batched else float(len(prompts)),
+                    "objects_per_state": float(len(prompts)) if batched else 1.0,
                 },
             ),
         )
 
-    def _sampled_source_indices(self, frame_count: int, annotations: list[PartAnnotation]) -> list[int]:
-        indices = set(range(0, frame_count, self.settings.sam2_frame_stride))
+    def _analyze_batched(
+        self,
+        provider: Any,
+        frame_dir: Path,
+        source_indices: list[int],
+        source_to_sampled_index: dict[int, int],
+        prompts: list[tuple[int, PartAnnotation, list[list[float]] | None, list[int] | None]],
+        observations: dict[int, dict[int, TrackObservation]],
+        on_progress: Any | None,
+    ) -> None:
+        state = self._initialize_state(provider, frame_dir)
+        expected_ids = {object_id for object_id, _annotation, _points, _labels in prompts}
+        for object_id, annotation, points, labels in prompts:
+            provider.add_new_points_or_box(
+                state,
+                frame_idx=source_to_sampled_index[annotation.frameIndex],
+                obj_id=object_id,
+                points=points,
+                labels=labels,
+                box=list(annotation.box) if annotation.box is not None else None,
+                clear_old_points=False,
+            )
+        for processed, (frame_index, returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
+            state,
+            start_frame_idx=len(source_indices) - 1,
+            reverse=True,
+        ), start=1):
+            numeric_ids = [int(object_id) for object_id in returned_ids]
+            masks = self._mask_items(mask_logits)
+            if len(numeric_ids) != len(masks) or len(numeric_ids) != len(expected_ids) or set(numeric_ids) != expected_ids:
+                raise VisionUnavailable("SAM2.1 returned an incomplete or mismatched set of tracked objects.")
+            source_index = source_indices[int(frame_index)]
+            for object_id, mask_for_object in zip(numeric_ids, masks, strict=True):
+                observations[object_id][source_index] = self._observation(source_index, mask_for_object)
+            if on_progress is not None:
+                on_progress(min(1.0, processed / len(source_indices)))
+
+    def _analyze_independently(
+        self,
+        provider: Any,
+        frame_dir: Path,
+        source_indices: list[int],
+        source_to_sampled_index: dict[int, int],
+        prompts: list[tuple[int, PartAnnotation, list[list[float]] | None, list[int] | None]],
+        observations: dict[int, dict[int, TrackObservation]],
+        on_progress: Any | None,
+    ) -> None:
+        for annotation_number, (object_id, annotation, points, labels) in enumerate(prompts, start=1):
+            state = self._initialize_state(provider, frame_dir)
+            provider.add_new_points_or_box(
+                state,
+                frame_idx=source_to_sampled_index[annotation.frameIndex],
+                obj_id=1,
+                points=points,
+                labels=labels,
+                box=list(annotation.box) if annotation.box is not None else None,
+                clear_old_points=False,
+            )
+            for processed, (frame_index, _returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
+                state,
+                start_frame_idx=len(source_indices) - 1,
+                reverse=True,
+            ), start=1):
+                if on_progress is not None:
+                    total = len(source_indices) * len(prompts)
+                    on_progress(min(1.0, ((annotation_number - 1) * len(source_indices) + processed) / total))
+                source_index = source_indices[int(frame_index)]
+                masks = self._mask_items(mask_logits)
+                if len(masks) != 1:
+                    raise VisionUnavailable("SAM2.1 returned an unexpected number of masks for an isolated object.")
+                observations[object_id][source_index] = self._observation(source_index, masks[0])
+
+    @staticmethod
+    def _supports_batched_objects(provider: Any) -> bool:
+        device = getattr(provider, "device", None)
+        return getattr(device, "type", None) == "cuda"
+
+    @staticmethod
+    def _is_cuda_out_of_memory(error: Exception) -> bool:
+        try:
+            import torch
+        except ImportError:
+            return False
+        return isinstance(error, torch.OutOfMemoryError)
+
+    def _sampled_source_indices(
+        self,
+        frame_count: int,
+        annotations: list[PartAnnotation],
+        frame_stride: int | None = None,
+    ) -> list[int]:
+        stride = frame_stride or self.settings.resolved_sam2_frame_stride()
+        indices = set(range(0, frame_count, stride))
         indices.add(frame_count - 1)
         indices.update(annotation.frameIndex for annotation in annotations)
         return sorted(indices)
@@ -331,7 +447,7 @@ class Sam2BackwardVisionAnalyzer:
             return attached + 2, attached + 1
         return None, None
 
-    def _events_from_part_tracks(self, tracks: list[PartTrack]) -> list[AnalysisEvent]:
+    def _events_from_part_tracks(self, tracks: list[PartTrack], frames: list[Frame] | None = None) -> list[AnalysisEvent]:
         events: list[AnalysisEvent] = []
         for track in tracks:
             if track.attachmentStartFrame is None or track.attachmentEndFrame is None:
@@ -340,11 +456,27 @@ class Sam2BackwardVisionAnalyzer:
                 eventId=f"event-{len(events) + 1:04d}",
                 kind="uncertain_change",
                 # Reassembly is the inverse of source/disassembly chronology.
-                startTimestampSeconds=(track.observations[-1].frameIndex - track.attachmentStartFrame) / self.settings.analysis_fps,
-                endTimestampSeconds=(track.observations[-1].frameIndex - track.attachmentEndFrame) / self.settings.analysis_fps,
+                startTimestampSeconds=(
+                    frames[-1].timestampSeconds - frames[track.attachmentStartFrame].timestampSeconds
+                    if frames is not None
+                    else (track.observations[-1].frameIndex - track.attachmentStartFrame) / self.settings.analysis_fps
+                ),
+                endTimestampSeconds=(
+                    frames[-1].timestampSeconds - frames[track.attachmentEndFrame].timestampSeconds
+                    if frames is not None
+                    else (track.observations[-1].frameIndex - track.attachmentEndFrame) / self.settings.analysis_fps
+                ),
                 affectedTrackIds=[f"part:{track.partId}"],
-                beforeFrameId=f"frame-{track.attachmentStartFrame:04d}",
-                afterFrameId=f"frame-{track.attachmentEndFrame:04d}",
+                beforeFrameId=(
+                    frames[track.attachmentStartFrame].frameId
+                    if frames is not None
+                    else f"frame-{track.attachmentStartFrame:04d}"
+                ),
+                afterFrameId=(
+                    frames[track.attachmentEndFrame].frameId
+                    if frames is not None
+                    else f"frame-{track.attachmentEndFrame:04d}"
+                ),
                 evidenceStrength=0.72,
                 uncertainty=None,
                 evidence=f"{track.name} moves from the side into sustained substantial overlap with another tracked part.",

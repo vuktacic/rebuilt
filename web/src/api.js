@@ -73,6 +73,14 @@ function liveClient(fetchImpl) {
       });
     },
 
+    suggestAnnotations(jobId, frameIndex = null) {
+      return request(`/jobs/${encodeURIComponent(jobId)}/annotation-suggestions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(frameIndex === null ? {} : { frameIndex }),
+      });
+    },
+
     trackBackward(jobId) {
       return request(`/jobs/${encodeURIComponent(jobId)}/track`, { method: "POST" });
     },
