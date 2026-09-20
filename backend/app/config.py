@@ -127,6 +127,9 @@ class Settings:
     data_dir: Path
     max_upload_bytes: int = 250 * 1024 * 1024
     model: str = "gpt-5.4"
+    manual_diff_model: str = "gpt-6-astra"
+    manual_draft_model: str = "gpt-5.6-luna"
+    manual_image_detail: str = "low"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1/responses"
     processing_timeout_seconds: float = 900.0
@@ -180,6 +183,9 @@ class Settings:
             data_dir=configured_dir,
             max_upload_bytes=int(os.getenv("REBUILT_MAX_UPLOAD_BYTES", 250 * 1024 * 1024)),
             model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
+            manual_diff_model=os.getenv("REBUILT_MANUAL_DIFF_MODEL", "gpt-6-astra"),
+            manual_draft_model=os.getenv("REBUILT_MANUAL_DRAFT_MODEL", "gpt-5.6-luna"),
+            manual_image_detail=os.getenv("REBUILT_MANUAL_IMAGE_DETAIL", "low"),
             openai_api_key=os.getenv("OPENAI_API_KEY") or None,
             openai_base_url=os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses"),
             processing_timeout_seconds=float(os.getenv("REBUILT_PROCESSING_TIMEOUT", "900")),

@@ -18,5 +18,12 @@ are stable for the lifetime of a job. A guide step must reference an existing
 selected frame and contain non-empty text. Error responses use
 `{"error":{"code":"...","message":"..."}}`.
 
+Manual review runs use `diffing` and persist one `manualReview.pairs` finding
+per saved pair. Failed pairs remain retryable and never become guide steps.
+Successful findings are handed to the text-only Luna drafting boundary; the
+draft request contains compact differences and allowlisted frame IDs, but no
+images, video bytes, or local filesystem paths. Findings that share an AFTER
+frame are compacted into one final guide step.
+
 The machine-readable schema is in [`job.schema.json`](job.schema.json). The
 fixtures are intentionally small and are used by backend and frontend tests.

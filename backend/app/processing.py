@@ -12,7 +12,8 @@ from typing import Any, Protocol
 
 from .config import Settings
 from .errors import AppError
-from .models import AnalysisEvent, Frame, Guide, GuideStep, JobError, PartAnnotation
+from .manual_processing import GuideDrafter, PairReviewer, validate_pair_finding
+from .models import AnalysisEvent, Frame, Guide, GuideStep, JobError, ManualReview, PairFinding, PartAnnotation
 from .storage import JobRepository
 from .vision import VisionAnalyzer
 
@@ -170,12 +171,16 @@ class JobProcessor:
         extractor: FFmpegExtractor | None = None,
         generator: GuideGenerator | None = None,
         analyzer: VisionAnalyzer | None = None,
+        manual_reviewer: PairReviewer | None = None,
+        manual_drafter: GuideDrafter | None = None,
     ):
         self.repository = repository
         self.settings = settings
         self.extractor = extractor or FFmpegExtractor(settings)
         self.generator = generator or OpenAIResponsesGenerator(settings)
         self.analyzer = analyzer
+        self.manual_reviewer = manual_reviewer
+        self.manual_drafter = manual_drafter
 
     def process(self, job_id: str) -> None:
         try:
@@ -295,6 +300,66 @@ class JobProcessor:
             self.repository.update(job_id, status="failed", error=JobError(code=exc.code, message=exc.message))
         except Exception:
             self.repository.update(job_id, status="failed", error=JobError(code="PROCESSING_FAILED", message="Backward tracking could not be completed."))
+
+    def run_manual(self, job_id: str, analysis_run_id: str) -> None:
+        """Review each saved pair independently and retain partial results."""
+        try:
+            job = self.repository.get(job_id)
+            if job is None or job.analysisRunId != analysis_run_id or job.status != "diffing":
+                return
+            if self.manual_reviewer is None:
+                raise AppError(503, "MANUAL_REVIEW_UNAVAILABLE", "Manual visual review is not configured.")
+            findings: list[PairFinding] = []
+            frames_by_id = {frame.frameId: frame for frame in job.frames}
+            for pair in job.manualPairs:
+                current = self.repository.get(job_id)
+                if current is None or current.analysisRunId != analysis_run_id:
+                    return
+                try:
+                    frame_paths = [
+                        self.repository.frame_path(job_id, pair.beforeFrameId),
+                        self.repository.frame_path(job_id, pair.afterFrameId),
+                    ]
+                    finding = self.manual_reviewer.review(
+                        pair,
+                        [frames_by_id[pair.beforeFrameId], frames_by_id[pair.afterFrameId]],
+                        frame_paths,
+                    )
+                    findings.append(validate_pair_finding(finding, pair, [frames_by_id[pair.beforeFrameId], frames_by_id[pair.afterFrameId]]))
+                except Exception:
+                    findings.append(PairFinding(
+                        pairId=pair.pairId,
+                        status="failed",
+                        action="uncertain_change",
+                        difference="Pair review failed.",
+                        uncertainty="insufficient_evidence",
+                        confidence=0,
+                        evidenceFrameIds=[pair.afterFrameId],
+                    ))
+                self.repository.update(job_id, manual_review=ManualReview(status="diffing", pairs=findings), error=None)
+            failed = any(finding.status == "failed" for finding in findings)
+            guide = None
+            guide_status = "degraded" if failed else "no_eligible_findings"
+            review_status = "degraded" if failed else "ready"
+            if not failed and self.manual_drafter is not None:
+                self.repository.update(job_id, manual_review=ManualReview(status="drafting", pairs=findings), error=None)
+                guide = deduplicate_guide_steps(validate_guide(self.manual_drafter.draft(findings, job.manualPairs, job.frames), job.frames))
+                guide_status = "ready"
+            self.repository.update(
+                job_id,
+                status="ready",
+                guide=guide,
+                manual_review=ManualReview(
+                    status=review_status,
+                    pairs=findings,
+                    guideStatus=guide_status,
+                ),
+                error=None,
+            )
+        except AppError as exc:
+            self.repository.update(job_id, status="ready", manual_review=ManualReview(status="degraded", guideStatus="degraded"), error=JobError(code=exc.code, message=exc.message))
+        except Exception:
+            self.repository.update(job_id, status="ready", manual_review=ManualReview(status="degraded", guideStatus="degraded"), error=JobError(code="MANUAL_REVIEW_FAILED", message="Manual visual review could not be completed."))
 
     def _finish_guide(self, job_id: str, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent]) -> None:
         if not events:

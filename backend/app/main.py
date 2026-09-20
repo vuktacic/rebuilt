@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Settings, VisionRuntimeError
 from .errors import AppError, error_payload
+from .manual_processing import OpenAIResponsesGuideDrafter, OpenAIResponsesPairReviewer
 from .models import AnnotationRequest, Guide, JobCreated, JobMode, JobResponse, ManualPairsRequest
 from .processing import JobProcessor, validate_guide
 from .storage import ADMISSION_STATUSES, JobRepository
@@ -60,6 +61,20 @@ class JobCoordinator:
 
         threading.Thread(target=run, name=f"rebuilt-track-{job_id}", daemon=True).start()
 
+    def start_manual(self, job_id: str, analysis_run_id: str) -> None:
+        with self._lock:
+            self._active_job_id = job_id
+
+        def run() -> None:
+            try:
+                self.processor.run_manual(job_id, analysis_run_id)
+            finally:
+                with self._lock:
+                    if self._active_job_id == job_id:
+                        self._active_job_id = None
+
+        threading.Thread(target=run, name=f"rebuilt-manual-{job_id}", daemon=True).start()
+
     def busy(self) -> bool:
         with self._lock:
             if self._active_job_id is None:
@@ -82,7 +97,17 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
         except AppError as exc:
             vision_error = exc
             analyzer = NoopVisionAnalyzer()
-        job_processor = JobProcessor(repository, resolved, analyzer=analyzer)
+        job_processor = JobProcessor(
+            repository,
+            resolved,
+            analyzer=analyzer,
+            manual_reviewer=OpenAIResponsesPairReviewer(
+                resolved,
+                model=resolved.manual_diff_model,
+                detail=resolved.manual_image_detail,
+            ),
+            manual_drafter=OpenAIResponsesGuideDrafter(resolved, model=resolved.manual_draft_model),
+        )
     else:
         job_processor = processor
     coordinator = JobCoordinator(repository, job_processor)
@@ -202,6 +227,25 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
             return repository.save_manual_pairs(job_id, revision=request.revision, pairs=request.pairs)
         except ValueError as exc:
             raise AppError(409, "PAIR_REVISION_CONFLICT", "The saved manual pairs changed. Refresh before saving again.") from exc
+
+    @app.post("/jobs/{job_id}/manual-run", response_model=JobResponse, status_code=202)
+    async def run_manual(job_id: str) -> JobResponse:
+        if not SAFE_ID.fullmatch(job_id):
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        if repository.get(job_id) is None:
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        run_id = str(uuid.uuid4())
+        try:
+            claimed = repository.claim_manual_run(job_id, run_id)
+        except KeyError as exc:
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.") from exc
+        except ValueError as exc:
+            code = str(exc)
+            if code == "MANUAL_PAIRS_REQUIRED":
+                raise AppError(422, code, "Save at least one valid manual pair before running review.") from exc
+            raise AppError(409, code, "This manual job is not ready to start another review run.") from exc
+        coordinator.start_manual(job_id, run_id)
+        return claimed
 
     @app.post("/jobs/{job_id}/track", response_model=JobResponse, status_code=202)
     async def track_backward(job_id: str) -> JobResponse:

@@ -6,10 +6,15 @@ from pydantic import BaseModel, Field
 
 
 JobMode = Literal["automated", "manual"]
-JobStatus = Literal["queued", "extracting", "annotating", "pairing", "analyzing", "generating", "ready", "failed"]
+JobStatus = Literal["queued", "extracting", "annotating", "pairing", "diffing", "drafting", "analyzing", "generating", "ready", "failed"]
 EventKind = Literal["attach", "detach", "uncertain_change"]
 TrackVisibility = Literal["visible", "occluded", "lost"]
 TrackMembership = Literal["separate", "attached", "unknown"]
+PairFindingStatus = Literal["completed", "needs_review", "failed"]
+PairFindingAction = Literal["attach", "detach", "uncertain_change", "no_change"]
+PairFindingUncertainty = Literal["occluded", "ambiguous", "insufficient_evidence"]
+ManualReviewStatus = Literal["not_started", "diffing", "drafting", "ready", "degraded"]
+ManualGuideStatus = Literal["not_started", "ready", "degraded", "no_eligible_findings"]
 
 
 class Frame(BaseModel):
@@ -30,6 +35,25 @@ class ManualPair(BaseModel):
 class ManualPairsRequest(BaseModel):
     revision: int = Field(ge=0)
     pairs: list[ManualPair] = Field(min_length=1)
+
+
+class PairFinding(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    pairId: str = Field(min_length=1)
+    status: PairFindingStatus
+    action: PairFindingAction
+    difference: str = Field(min_length=1)
+    uncertainty: PairFindingUncertainty | None = None
+    confidence: float = Field(ge=0, le=1)
+    evidenceFrameIds: list[str] = Field(min_length=1)
+    attemptCount: int = Field(default=1, ge=1)
+
+
+class ManualReview(BaseModel):
+    status: ManualReviewStatus = "not_started"
+    pairs: list[PairFinding] = Field(default_factory=list)
+    guideStatus: ManualGuideStatus = "not_started"
 
 
 class TrackSummary(BaseModel):
@@ -120,6 +144,8 @@ class JobResponse(BaseModel):
     frames: list[Frame] = Field(default_factory=list)
     revision: int = Field(default=0, ge=0)
     manualPairs: list[ManualPair] = Field(default_factory=list)
+    manualReview: ManualReview | None = None
+    analysisRunId: str | None = None
     tracks: list[TrackSummary] = Field(default_factory=list)
     annotations: list[PartAnnotation] = Field(default_factory=list)
     partTracks: list[PartTrack] = Field(default_factory=list)

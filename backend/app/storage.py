@@ -6,10 +6,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobMode, JobResponse, JobStatus, ManualPair, PartAnnotation, PartTrack, TrackSummary
+from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobMode, JobResponse, JobStatus, ManualPair, ManualReview, PartAnnotation, PartTrack, TrackSummary
 
 
-ACTIVE_STATUSES = {"queued", "extracting", "analyzing", "generating"}
+ACTIVE_STATUSES = {"queued", "extracting", "diffing", "drafting", "analyzing", "generating"}
 ADMISSION_STATUSES = ACTIVE_STATUSES | {"annotating", "pairing"}
 
 
@@ -61,6 +61,8 @@ class JobRepository:
         events: list[AnalysisEvent] | None = None,
         analysis: AnalysisInfo | None = None,
         guide: Guide | None = None,
+        manual_review: ManualReview | None = None,
+        analysis_run_id: str | None = None,
         error: JobError | None = None,
     ) -> JobResponse:
         with self._lock:
@@ -78,6 +80,8 @@ class JobRepository:
                     "events": events if events is not None else current.events,
                     "analysis": analysis if analysis is not None else current.analysis,
                     "guide": guide if guide is not None else current.guide,
+                    "manualReview": manual_review if manual_review is not None else current.manualReview,
+                    "analysisRunId": analysis_run_id if analysis_run_id is not None else current.analysisRunId,
                     "error": error,
                 }
             )
@@ -95,6 +99,19 @@ class JobRepository:
             if current.revision != revision:
                 raise ValueError("PAIR_REVISION_CONFLICT")
             updated = current.model_copy(update={"manualPairs": pairs, "revision": current.revision + 1, "error": None})
+            self._write_json(self._job_dir(job_id) / "metadata.json", updated.model_dump())
+            return updated
+
+    def claim_manual_run(self, job_id: str, analysis_run_id: str) -> JobResponse:
+        with self._lock:
+            current = self.get(job_id)
+            if current is None:
+                raise KeyError(job_id)
+            if current.mode != "manual" or current.status != "pairing":
+                raise ValueError("MANUAL_RUN_NOT_READY")
+            if not current.manualPairs:
+                raise ValueError("MANUAL_PAIRS_REQUIRED")
+            updated = current.model_copy(update={"status": "diffing", "analysisRunId": analysis_run_id, "manualReview": ManualReview(status="diffing")})
             self._write_json(self._job_dir(job_id) / "metadata.json", updated.model_dump())
             return updated
 
@@ -134,9 +151,18 @@ class JobRepository:
         for metadata in jobs_dir.glob("*/metadata.json"):
             try:
                 raw = json.loads(metadata.read_text(encoding="utf-8"))
-                if raw.get("status") in ACTIVE_STATUSES:
+                if raw.get("status") in {"diffing", "drafting"} and raw.get("mode", "automated") == "manual":
+                    raw["status"] = "ready"
+                    review: dict[str, Any] = raw.get("manualReview") or {"pairs": []}
+                    review["status"] = "degraded"
+                    review["guideStatus"] = "degraded"
+                    raw["manualReview"] = review
+                elif raw.get("status") in ACTIVE_STATUSES:
                     raw["status"] = "failed"
                     raw["error"] = {"code": "INTERRUPTED", "message": "Processing was interrupted by a server restart."}
-                    self._write_json(metadata, raw)
+                else:
+                    continue
+                raw["error"] = {"code": "INTERRUPTED", "message": "Processing was interrupted by a server restart."}
+                self._write_json(metadata, raw)
             except (OSError, ValueError, TypeError):
                 continue
