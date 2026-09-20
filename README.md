@@ -116,3 +116,26 @@ every other extracted frame. This keeps a fixed-camera demo responsive while
 preserving the source frame IDs used for evidence. Set `MLX_SAM3_IMAGE_SIZE`
 or `MLX_SAM3_FRAME_STRIDE=1` for a higher-detail pass; expect that to increase
 local analysis time materially.
+
+### Fast manual SAM2 reverse tracking on Apple Silicon
+
+The default `sam2` backend now uses a fast temporal profile: it propagates
+every other extracted frame, always includes saved annotation frames and the
+final frame, then restores source-frame IDs in the review track. This reduces
+the default model work by about half while keeping the UI and guide references
+in original video coordinates. Set `SAM2_FRAME_STRIDE=1` for maximum temporal
+detail.
+
+For a native MLX implementation of the same manual backward-tracking workflow,
+use the separate pinned runtime:
+
+```bash
+./scripts/bootstrap_mlx_sam2.sh
+./scripts/run_backend_mlx_sam2.sh
+```
+
+It defaults to SAM2.1 Hiera-Small at 768px with float16 memory and batched image
+feature precomputation. Override the `SAM2_MLX_*` settings only when validating
+quality against the source-frame overlay. `SAM2_VOS_OPTIMIZED=1` enables Meta's
+experimental compiled PyTorch predictor; benchmark a warm server before using
+it because compilation can make a first short video slower.

@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-VALID_VISION_BACKENDS = frozenset({"auto", "noop", "sam2", "sam3", "sam3-cuda", "sam3-mlx"})
+VALID_VISION_BACKENDS = frozenset({"auto", "noop", "sam2", "sam2-mlx", "sam3", "sam3-cuda", "sam3-mlx"})
 
 
 class VisionRuntimeError(RuntimeError):
@@ -91,7 +91,7 @@ def resolve_vision_backend(
             "VISION_BACKEND_INCOMPATIBLE",
             "sam3-mlx is supported only on native arm64 macOS with Apple Metal.",
         )
-    return "sam3-mlx"
+    return "sam2-mlx" if configured == "sam2-mlx" else "sam3-mlx"
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -147,6 +147,13 @@ class Settings:
     vision_worker: bool = True
     sam2_checkpoint: Path | None = None
     sam2_model_config: str = "configs/sam2.1/sam2.1_hiera_s.yaml"
+    sam2_frame_stride: int = 2
+    sam2_apply_postprocessing: bool = False
+    sam2_vos_optimized: bool = False
+    sam2_mlx_model_id: str = "avbiswas/sam2.1-hiera-small-mlx"
+    sam2_mlx_image_size: int = 768
+    sam2_mlx_precompute_features: bool = True
+    sam2_mlx_feature_batch_size: int = 4
     mlx_model_dir: Path | None = None
     mlx_model_revision: str = "38eced50afd50303f207c0165d0299991373c683"
     mlx_vlm_revision: str = "a5deef1ce4b0b5ef2a01e5a02a36805878a7ee3c"
@@ -193,6 +200,13 @@ class Settings:
             vision_worker=os.getenv("REBUILT_VISION_WORKER", "1").lower() not in {"0", "false", "no"},
             sam2_checkpoint=Path(os.environ["SAM2_CHECKPOINT"]) if os.getenv("SAM2_CHECKPOINT") else (local_sam2_checkpoint if local_sam2_checkpoint.is_file() else None),
             sam2_model_config=os.getenv("SAM2_MODEL_CONFIG", "configs/sam2.1/sam2.1_hiera_s.yaml"),
+            sam2_frame_stride=max(1, int(os.getenv("SAM2_FRAME_STRIDE", "2"))),
+            sam2_apply_postprocessing=os.getenv("SAM2_APPLY_POSTPROCESSING", "0").lower() in {"1", "true", "yes"},
+            sam2_vos_optimized=os.getenv("SAM2_VOS_OPTIMIZED", "0").lower() in {"1", "true", "yes"},
+            sam2_mlx_model_id=os.getenv("SAM2_MLX_MODEL_ID", "avbiswas/sam2.1-hiera-small-mlx"),
+            sam2_mlx_image_size=max(16, int(os.getenv("SAM2_MLX_IMAGE_SIZE", "768"))),
+            sam2_mlx_precompute_features=os.getenv("SAM2_MLX_PRECOMPUTE_FEATURES", "1").lower() not in {"0", "false", "no"},
+            sam2_mlx_feature_batch_size=max(1, int(os.getenv("SAM2_MLX_FEATURE_BATCH_SIZE", "4"))),
             mlx_model_dir=Path(os.getenv("MLX_SAM3_MODEL_DIR", local_mlx_model)),
             mlx_model_revision=os.getenv("MLX_SAM3_MODEL_REVISION", "38eced50afd50303f207c0165d0299991373c683"),
             mlx_vlm_revision=os.getenv("MLX_VLM_REVISION", "a5deef1ce4b0b5ef2a01e5a02a36805878a7ee3c"),

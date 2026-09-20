@@ -92,12 +92,19 @@ class Sam2BackwardVisionAnalyzer:
         if any(annotation.frameIndex >= frame_count for annotation in annotations):
             raise AppError(422, "ANNOTATION_FRAME_INVALID", "An annotation refers to a frame that was not extracted.")
         started = time.monotonic()
-        provider = self._provider or self._load_provider()
+        if self._provider is None:
+            self._provider = self._load_provider()
+        provider = self._provider
+        source_indices = self._sampled_source_indices(frame_count, annotations)
+        source_to_sampled_index = {source_index: sampled_index for sampled_index, source_index in enumerate(source_indices)}
         with tempfile.TemporaryDirectory(prefix="rebuilt-sam2-frames-") as temporary_dir:
             sam2_frame_dir = Path(temporary_dir)
-            for frame_index, source in enumerate(sorted(frame_dir.glob("frame-*.jpg"))):
-                (sam2_frame_dir / f"{frame_index:06d}.jpg").symlink_to(source.resolve())
-            state = provider.init_state(str(sam2_frame_dir))
+            source_frames = sorted(frame_dir.glob("frame-*.jpg"))
+            if len(source_frames) != frame_count:
+                raise VisionUnavailable("SAM2.1 did not receive every extracted frame.")
+            for sampled_index, source_index in enumerate(source_indices):
+                (sam2_frame_dir / f"{sampled_index:06d}.jpg").symlink_to(source_frames[source_index].resolve())
+            state = self._initialize_state(provider, sam2_frame_dir)
         object_ids: dict[str, int] = {}
         for annotation in annotations:
             name = annotation.name.strip()
@@ -110,7 +117,7 @@ class Sam2BackwardVisionAnalyzer:
                 raise AppError(422, "ANNOTATION_INVALID", "Each part needs at least one point or a bounding box.")
             provider.add_new_points_or_box(
                 state,
-                frame_idx=annotation.frameIndex,
+                frame_idx=source_to_sampled_index[annotation.frameIndex],
                 obj_id=object_id,
                 points=points,
                 labels=labels,
@@ -121,22 +128,20 @@ class Sam2BackwardVisionAnalyzer:
         observations: dict[int, dict[int, TrackObservation]] = {object_id: {} for object_id in object_ids.values()}
         for processed, (frame_index, returned_ids, mask_logits) in enumerate(provider.propagate_in_video(
             state,
-            start_frame_idx=frame_count - 1,
+            start_frame_idx=len(source_indices) - 1,
             reverse=True,
         ), start=1):
             if on_progress is not None:
-                on_progress(min(1.0, processed / frame_count))
+                on_progress(min(1.0, processed / len(source_indices)))
             for object_id, mask_logits_for_object in zip(returned_ids, self._mask_items(mask_logits), strict=False):
                 numeric_id = int(object_id)
                 if numeric_id in observations:
-                    observations[numeric_id][int(frame_index)] = self._observation(int(frame_index), mask_logits_for_object)
+                    source_index = source_indices[int(frame_index)]
+                    observations[numeric_id][source_index] = self._observation(source_index, mask_logits_for_object)
 
         tracks: list[PartTrack] = []
         for name, object_id in object_ids.items():
-            chronological = [
-                observations[object_id].get(frame_index, TrackObservation(frameIndex=frame_index, visible=False))
-                for frame_index in range(frame_count)
-            ]
+            chronological = self._restore_source_observations(observations[object_id], frame_count)
             tracks.append(PartTrack(
                 partId=object_id,
                 name=name,
@@ -169,13 +174,66 @@ class Sam2BackwardVisionAnalyzer:
             tracks=summaries,
             part_tracks=tracks,
             analysis=AnalysisInfo(
-                backend="sam2.1-backward",
-                modelVersion=self.settings.sam2_model_config,
+                backend=self._analysis_backend(),
+                modelVersion=self._analysis_model_version(),
                 configVersion=self.settings.analysis_config_version,
                 durationSeconds=elapsed,
-                metrics={"frames": float(frame_count), "parts": float(len(tracks)), "events": float(len(events))},
+                metrics={
+                    "frames": float(frame_count),
+                    "sampled_frames": float(len(source_indices)),
+                    "frame_stride": float(self.settings.sam2_frame_stride),
+                    "parts": float(len(tracks)),
+                    "events": float(len(events)),
+                },
             ),
         )
+
+    def _sampled_source_indices(self, frame_count: int, annotations: list[PartAnnotation]) -> list[int]:
+        indices = set(range(0, frame_count, self.settings.sam2_frame_stride))
+        indices.add(frame_count - 1)
+        indices.update(annotation.frameIndex for annotation in annotations)
+        return sorted(indices)
+
+    def _initialize_state(self, provider: Any, frame_dir: Path) -> Any:
+        return provider.init_state(str(frame_dir))
+
+    def _analysis_backend(self) -> str:
+        return "sam2.1-backward"
+
+    def _analysis_model_version(self) -> str:
+        return self.settings.sam2_model_config
+
+    @staticmethod
+    def _restore_source_observations(
+        sampled: dict[int, TrackObservation],
+        frame_count: int,
+    ) -> list[TrackObservation]:
+        restored: list[TrackObservation] = []
+        sampled_indexes = sorted(sampled)
+        for frame_index in range(frame_count):
+            exact = sampled.get(frame_index)
+            if exact is not None:
+                restored.append(exact)
+                continue
+            before = max((index for index in sampled_indexes if index < frame_index), default=None)
+            after = min((index for index in sampled_indexes if index > frame_index), default=None)
+            if before is None or after is None:
+                restored.append(TrackObservation(frameIndex=frame_index, visible=False))
+                continue
+            left, right = sampled[before], sampled[after]
+            if not (left.visible and right.visible and left.bbox and right.bbox and left.centroid and right.centroid):
+                restored.append(TrackObservation(frameIndex=frame_index, visible=False))
+                continue
+            ratio = (frame_index - before) / (after - before)
+            interpolate = lambda start, end: start + (end - start) * ratio
+            restored.append(TrackObservation(
+                frameIndex=frame_index,
+                centroid=tuple(interpolate(start, end) for start, end in zip(left.centroid, right.centroid, strict=True)),
+                bbox=tuple(interpolate(start, end) for start, end in zip(left.bbox, right.bbox, strict=True)),
+                orientationDegrees=None if left.orientationDegrees is None or right.orientationDegrees is None else interpolate(left.orientationDegrees, right.orientationDegrees),
+                visible=True,
+            ))
+        return restored
 
     def _load_provider(self) -> Any:
         checkpoint = self.settings.sam2_checkpoint
@@ -188,7 +246,13 @@ class Sam2BackwardVisionAnalyzer:
             raise VisionUnavailable("SAM2.1 dependencies are unavailable; run scripts/bootstrap_sam2.sh.") from exc
         device = "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
         try:
-            return build_sam2_video_predictor(self.settings.sam2_model_config, str(checkpoint), device=device)
+            return build_sam2_video_predictor(
+                self.settings.sam2_model_config,
+                str(checkpoint),
+                device=device,
+                apply_postprocessing=self.settings.sam2_apply_postprocessing,
+                vos_optimized=self.settings.sam2_vos_optimized,
+            )
         except Exception as exc:
             raise VisionUnavailable(f"SAM2.1 could not be loaded: {type(exc).__name__}") from exc
 
@@ -199,7 +263,6 @@ class Sam2BackwardVisionAnalyzer:
         if isinstance(mask_logits, (list, tuple)):
             return list(mask_logits)
         return [mask_logits]
-
     @staticmethod
     def _observation(frame_index: int, mask_logits: Any) -> TrackObservation:
         try:
@@ -286,6 +349,38 @@ class Sam2BackwardVisionAnalyzer:
                 evidence=f"{track.name} moves from the side into sustained substantial overlap with another tracked part.",
             ))
         return sorted(events, key=lambda event: event.startTimestampSeconds)
+
+
+class MlxSam2BackwardVisionAnalyzer(Sam2BackwardVisionAnalyzer):
+    """Native MLX SAM2.1 adapter for Apple-Silicon reverse tracking."""
+
+    def _load_provider(self) -> Any:
+        try:
+            from mlx_sam import SAM2VideoPredictor
+        except ImportError as exc:
+            raise VisionUnavailable("MLX SAM2.1 dependencies are unavailable; run scripts/bootstrap_mlx_sam2.sh.") from exc
+        try:
+            return SAM2VideoPredictor.from_pretrained(
+                self.settings.sam2_mlx_model_id,
+                image_size=self.settings.sam2_mlx_image_size,
+                memory_dtype="float16",
+                memory_attention_dtype="float16",
+            )
+        except Exception as exc:
+            raise VisionUnavailable(f"MLX SAM2.1 could not be loaded: {type(exc).__name__}") from exc
+
+    def _initialize_state(self, provider: Any, frame_dir: Path) -> Any:
+        return provider.init_state(
+            str(frame_dir),
+            precompute_image_features=self.settings.sam2_mlx_precompute_features,
+            feature_batch_size=self.settings.sam2_mlx_feature_batch_size,
+        )
+
+    def _analysis_backend(self) -> str:
+        return "sam2.1-mlx-backward"
+
+    def _analysis_model_version(self) -> str:
+        return f"{self.settings.sam2_mlx_model_id}@{self.settings.sam2_mlx_image_size}px"
 
 
 class VisionUnavailable(AppError):
@@ -449,6 +544,8 @@ def create_vision_analyzer(settings: Settings) -> VisionAnalyzer:
         return NoopVisionAnalyzer()
     if backend == "sam2":
         return Sam2BackwardVisionAnalyzer(settings)  # type: ignore[return-value]
+    if backend == "sam2-mlx":
+        return MlxSam2BackwardVisionAnalyzer(settings)  # type: ignore[return-value]
     if backend == "sam3-mlx":
         return MlxSam3VisionAnalyzer(settings)
     return Sam3VisionAnalyzer(settings)
@@ -462,6 +559,10 @@ def validate_vision_runtime(settings: Settings) -> str:
             raise VisionUnavailable("SAM2.1 dependencies are unavailable; run scripts/bootstrap_sam2.sh.")
         if settings.sam2_checkpoint is None or not settings.sam2_checkpoint.is_file():
             raise VisionWeightsMissing("The configured SAM2.1 checkpoint is unavailable; run scripts/bootstrap_sam2.sh.")
+        return backend
+    if backend == "sam2-mlx":
+        if importlib.util.find_spec("mlx_sam") is None:
+            raise VisionUnavailable("MLX SAM2.1 dependencies are unavailable; run scripts/bootstrap_mlx_sam2.sh.")
         return backend
     if backend != "sam3-mlx":
         return backend

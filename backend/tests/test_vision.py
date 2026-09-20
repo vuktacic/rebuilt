@@ -8,7 +8,7 @@ import pytest
 
 import backend.app.vision as vision_module
 from backend.app.config import Settings
-from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, PartTrack, TrackObservation, TrackSummary
+from backend.app.models import AnalysisEvent, AnalysisInfo, Frame, Guide, GuideStep, PartAnnotation, PartTrack, PointPrompt, TrackObservation, TrackSummary
 from backend.app.processing import ExtractedFrames, JobProcessor
 from backend.app.storage import JobRepository
 from backend.app.vision import (
@@ -16,6 +16,7 @@ from backend.app.vision import (
     Detection,
     EventDetector,
     MlxSam3VisionAnalyzer,
+    MlxSam2BackwardVisionAnalyzer,
     PersistentTrackAssociator,
     Sam2BackwardVisionAnalyzer,
     Sam3VisionAnalyzer,
@@ -49,6 +50,101 @@ def test_sam2_attachment_rejects_transient_overlap() -> None:
     moving = [observation(frame, (0, 0, 10, 10) if frame == 1 else (30, 0, 10, 10)) for frame in range(7)]
     anchor = [observation(frame, (0, 0, 10, 10)) for frame in range(7)]
     assert Sam2BackwardVisionAnalyzer._attachment_range(moving, [anchor]) == (None, None)
+
+
+class SamplingSam2Provider:
+    def __init__(self) -> None:
+        self.loaded_frame_names: list[str] = []
+        self.prompt_frames: list[int] = []
+
+    def init_state(self, frame_dir: str) -> object:
+        self.loaded_frame_names = sorted(path.name for path in Path(frame_dir).glob("*.jpg"))
+        return object()
+
+    def add_new_points_or_box(self, state: object, *, frame_idx: int, **_: object) -> None:
+        self.prompt_frames.append(frame_idx)
+
+    def propagate_in_video(self, state: object, *, start_frame_idx: int, reverse: bool):
+        assert reverse is True
+        for frame_idx in range(start_frame_idx, -1, -1):
+            yield frame_idx, [1], [[[[-1.0, -1.0], [-1.0, -1.0]]]]
+
+
+def test_sam2_fast_profile_tracks_sampled_frames_and_restores_source_frame_indexes(tmp_path: Path) -> None:
+    provider = SamplingSam2Provider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for index in range(5):
+        (frame_dir / f"frame-{index:04d}.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(
+        Settings(data_dir=tmp_path, analysis_fps=2, sam2_frame_stride=2),
+        provider=provider,
+    )
+
+    result = analyzer.analyze_annotated(
+        frame_dir,
+        frame_count=5,
+        job_id="sampled",
+        annotations=[PartAnnotation(name="panel", frameIndex=4, points=[PointPrompt(x=1, y=1)])],
+    )
+
+    assert provider.loaded_frame_names == ["000000.jpg", "000001.jpg", "000002.jpg"]
+    assert provider.prompt_frames == [2]
+    assert [item.frameIndex for item in result.part_tracks[0].observations] == [0, 1, 2, 3, 4]
+    assert result.analysis.metrics["sampled_frames"] == 3.0
+
+
+def test_sam2_analyzer_reuses_the_loaded_provider_between_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SamplingSam2Provider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    (frame_dir / "frame-0000.jpg").write_bytes(b"fake-jpeg")
+    analyzer = Sam2BackwardVisionAnalyzer(Settings(data_dir=tmp_path, sam2_frame_stride=1))
+    loads = 0
+
+    def load_provider() -> SamplingSam2Provider:
+        nonlocal loads
+        loads += 1
+        return provider
+
+    monkeypatch.setattr(analyzer, "_load_provider", load_provider)
+    annotation = [PartAnnotation(name="panel", frameIndex=0, points=[PointPrompt(x=1, y=1)])]
+
+    analyzer.analyze_annotated(frame_dir, 1, "first", annotation)
+    analyzer.analyze_annotated(frame_dir, 1, "second", annotation)
+
+    assert loads == 1
+
+
+class MlxSamplingSam2Provider(SamplingSam2Provider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.init_options: dict[str, object] = {}
+
+    def init_state(self, frame_dir: str, **kwargs: object) -> object:
+        self.init_options = kwargs
+        return super().init_state(frame_dir)
+
+
+def test_mlx_sam2_uses_batched_feature_precompute_for_reverse_tracking(tmp_path: Path) -> None:
+    provider = MlxSamplingSam2Provider()
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    (frame_dir / "frame-0000.jpg").write_bytes(b"fake-jpeg")
+    analyzer = MlxSam2BackwardVisionAnalyzer(
+        Settings(data_dir=tmp_path, sam2_mlx_precompute_features=True, sam2_mlx_feature_batch_size=6),
+        provider=provider,
+    )
+
+    result = analyzer.analyze_annotated(
+        frame_dir,
+        frame_count=1,
+        job_id="mlx",
+        annotations=[PartAnnotation(name="panel", frameIndex=0, points=[PointPrompt(x=1, y=1)])],
+    )
+
+    assert provider.init_options == {"precompute_image_features": True, "feature_batch_size": 6}
+    assert result.analysis.backend == "sam2.1-mlx-backward"
 
 
 def detection_series(*, hand_occluded: bool = False) -> list[Detection]:
