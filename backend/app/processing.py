@@ -158,9 +158,18 @@ def deduplicate_guide_steps(guide: Guide) -> Guide:
             order.append(step.frameId)
             continue
         sentences = list(dict.fromkeys((existing.text.strip(), step.text.strip())))
-        uncertainty = existing.uncertainty or step.uncertainty
+        uncertainties = list(dict.fromkeys(value for value in (existing.uncertainty, step.uncertainty) if value))
+        uncertainty = "; ".join(uncertainties) or None
         merged[step.frameId] = GuideStep(text=" ".join(sentences), frameId=step.frameId, uncertainty=uncertainty)
     return Guide(title=guide.title, steps=[merged[frame_id] for frame_id in order])
+
+
+def validate_event_guide_coverage(guide: Guide, events: list[AnalysisEvent]) -> None:
+    """Require one generated instruction for each distinct completed-state image."""
+    required_frames = {event.afterFrameId for event in events}
+    generated_frames = {step.frameId for step in guide.steps}
+    if not required_frames.issubset(generated_frames):
+        raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model omitted a distinct completed-state image.")
 
 
 class JobProcessor:
@@ -192,6 +201,7 @@ class JobProcessor:
             if input_path is None:
                 raise AppError(422, "VIDEO_MISSING", "The uploaded video is missing.")
             extracted = self.extractor.extract(input_path, self.repository._job_dir(job_id) / "frames", job_id)
+            source_end_timestamp = max(frame.timestampSeconds for frame in extracted.frames)
             extracted = ExtractedFrames(
                 frames=[
                     frame.model_copy(
@@ -200,7 +210,7 @@ class JobProcessor:
                             "assemblyTimeSeconds": (
                                 frame.assemblyTimeSeconds
                                 if frame.assemblyTimeSeconds is not None
-                                else (len(extracted.frames) - 1 - index) / self.settings.analysis_fps
+                                else source_end_timestamp - frame.timestampSeconds
                             ),
                         }
                     )
@@ -248,6 +258,7 @@ class JobProcessor:
                             self._generate_guide(frames_for_generation, paths_for_generation, event_batch),
                             frames_for_generation,
                         )
+                        validate_event_guide_coverage(generated, event_batch)
                         if len(generated.steps) > len(event_batch):
                             raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model returned more steps than supported event evidence.")
                         generated_guides.append(generated)
@@ -386,6 +397,7 @@ class JobProcessor:
                     self._generate_guide([frame for frame, _ in selected], [path for _, path in selected], event_batch),
                     [frame for frame, _ in selected],
                 )
+                validate_event_guide_coverage(generated, event_batch)
                 if len(generated.steps) > len(event_batch):
                     raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model returned more steps than supported event evidence.")
                 generated_guides.append(generated)

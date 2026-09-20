@@ -27,6 +27,15 @@ class ManualExtractor:
         return ExtractedFrames(frames=frames, paths=paths)
 
 
+class IrregularTimestampExtractor(ManualExtractor):
+    def extract(self, input_path: Path, output_dir: Path, job_id: str) -> ExtractedFrames:
+        extracted = super().extract(input_path, output_dir, job_id)
+        return ExtractedFrames(
+            frames=[frame.model_copy(update={"timestampSeconds": timestamp}) for frame, timestamp in zip(extracted.frames, [1.0, 4.0, 10.0], strict=True)],
+            paths=extracted.paths,
+        )
+
+
 class ManualGuideGenerator:
     def generate(self, frames: list[Frame], frame_paths: list[Path]) -> Guide:
         return Guide(title="Unused", steps=[GuideStep(text="Unused.", frameId=frames[0].frameId)])
@@ -93,6 +102,16 @@ class SharedImageAnalyzer:
         )
 
 
+class DistinctAfterAnalyzer(SharedImageAnalyzer):
+    def analyze(self, frame_dir: Path, frame_count: int, job_id: str) -> AnalysisResult:
+        result = super().analyze(frame_dir, frame_count, job_id)
+        return AnalysisResult(
+            events=[result.events[0], result.events[1].model_copy(update={"afterFrameId": "frame-0002"})],
+            tracks=result.tracks,
+            analysis=result.analysis,
+        )
+
+
 class SharedImageGuideGenerator:
     def generate(self, frames: list[Frame], frame_paths: list[Path], events: list[AnalysisEvent] | None = None) -> Guide:
         assert events is not None
@@ -112,7 +131,7 @@ def wait_for_status(app, job_id: str, status: str) -> dict:
         payload = response.json()
         if payload["status"] == status:
             return payload
-        if payload["status"] == "failed":
+        if payload["status"] == "failed" and status != "failed":
             raise AssertionError(payload)
         time.sleep(0.01)
     raise AssertionError(f"job did not reach {status}")
@@ -140,9 +159,27 @@ def test_manual_job_enters_pairing_with_server_owned_assembly_timestamps(tmp_pat
     job = wait_for_status(app, created.json()["jobId"], "pairing")
     assert job["mode"] == "manual"
     assert [frame["sourceIndex"] for frame in job["frames"]] == [0, 1, 2]
-    assert [frame["assemblyTimeSeconds"] for frame in job["frames"]] == [1.0, 0.5, 0.0]
+    assert [frame["assemblyTimeSeconds"] for frame in job["frames"]] == [2.0, 1.0, 0.0]
     assert job["manualPairs"] == []
     assert job["revision"] == 0
+
+
+def test_manual_timestamp_fallback_uses_raw_time_for_irregular_frames(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path)
+    repository = JobRepository(tmp_path)
+    processor = JobProcessor(repository, settings, extractor=IrregularTimestampExtractor(), generator=ManualGuideGenerator())
+    app = create_app(settings, processor=processor)
+
+    created = asyncio.run(request(
+        app,
+        "POST",
+        "/jobs",
+        data={"mode": "manual"},
+        files={"video": ("build.mp4", b"video", "video/mp4")},
+    ))
+    job = wait_for_status(app, created.json()["jobId"], "pairing")
+
+    assert [frame["assemblyTimeSeconds"] for frame in job["frames"]] == [9.0, 6.0, 0.0]
 
 
 def test_manual_pair_save_is_revision_guarded_and_validates_assembly_order(tmp_path: Path) -> None:
@@ -244,8 +281,8 @@ def test_final_guide_merges_steps_that_share_an_evidence_image() -> None:
     guide = Guide(
         title="Build",
         steps=[
-            GuideStep(text="Place the red brick.", frameId="frame-0004"),
-            GuideStep(text="Add the blue plate.", frameId="frame-0004"),
+            GuideStep(text="Place the red brick.", frameId="frame-0004", uncertainty="The hand obscures the left edge."),
+            GuideStep(text="Add the blue plate.", frameId="frame-0004", uncertainty="The final alignment is partially hidden."),
             GuideStep(text="Press both pieces down.", frameId="frame-0005"),
         ],
     )
@@ -254,6 +291,7 @@ def test_final_guide_merges_steps_that_share_an_evidence_image() -> None:
 
     assert [step.frameId for step in compacted.steps] == ["frame-0004", "frame-0005"]
     assert compacted.steps[0].text == "Place the red brick. Add the blue plate."
+    assert compacted.steps[0].uncertainty == "The hand obscures the left edge.; The final alignment is partially hidden."
 
 
 def test_generation_accepts_one_compact_step_for_multiple_events_on_the_same_image(tmp_path: Path) -> None:
@@ -272,6 +310,24 @@ def test_generation_accepts_one_compact_step_for_multiple_events_on_the_same_ima
     job = wait_for_status(app, created.json()["jobId"], "ready")
 
     assert job["guide"]["steps"] == [{"text": "Attach both visible pieces.", "frameId": "frame-0001", "uncertainty": None}]
+
+
+def test_generation_rejects_omitting_a_distinct_completed_state_image(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path)
+    repository = JobRepository(tmp_path)
+    processor = JobProcessor(
+        repository,
+        settings,
+        extractor=ManualExtractor(),
+        generator=SharedImageGuideGenerator(),
+        analyzer=DistinctAfterAnalyzer(),
+    )
+    app = create_app(settings, processor=processor)
+
+    created = asyncio.run(request(app, "POST", "/jobs", files={"video": ("build.mp4", b"video", "video/mp4")}))
+    job = wait_for_status(app, created.json()["jobId"], "failed")
+
+    assert job["error"]["code"] == "MODEL_INVALID_OUTPUT"
 
 
 def test_manual_run_reviews_each_saved_pair_and_persists_findings(tmp_path: Path) -> None:
