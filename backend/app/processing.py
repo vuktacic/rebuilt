@@ -24,8 +24,9 @@ class GuideGenerator(Protocol):
 PROMPT = """You turn ordered frames from a fixed-camera LEGO build video into a concise assembly guide.
 Describe only visible assembly changes, use a clear completed-state frame for each step when possible,
 and mention uncertainty when a hand or occlusion hides placement. Local analysis labels each pair BEFORE
-and AFTER; describe additions for attach events and removals for detach events. Return exactly one
-step per supplied event, in event order, without merging separate events.
+and AFTER; describe additions for attach events and removals for detach events. Return concise, non-duplicative steps in event order. If several supplied events
+use the same completed-state frame, combine their visible changes into one step
+for that frame rather than repeating the image with near-identical instructions.
 Write every title and step in clear, neutral Standard Technical English. Use precise imperative verbs,
 consistent part references, and short unambiguous sentences; avoid slang, idioms, conversational filler,
 or region-specific phrasing.
@@ -117,7 +118,16 @@ class FFmpegExtractor:
         paths = sorted(output_dir.glob("frame-*.jpg"))
         if not paths:
             raise AppError(422, "VIDEO_EMPTY", "The video did not contain any decodable frames.")
-        frames = [Frame(frameId=f"frame-{index:04d}", timestampSeconds=index / self.settings.analysis_fps, imageUrl=f"/jobs/{job_id}/frames/frame-{index:04d}") for index in range(len(paths))]
+        frames = [
+            Frame(
+                frameId=f"frame-{index:04d}",
+                sourceIndex=index,
+                timestampSeconds=index / self.settings.analysis_fps,
+                assemblyTimeSeconds=(len(paths) - 1 - index) / self.settings.analysis_fps,
+                imageUrl=f"/jobs/{job_id}/frames/frame-{index:04d}",
+            )
+            for index in range(len(paths))
+        ]
         for index, path in enumerate(paths):
             target = output_dir / f"frame-{index:04d}.jpg"
             path.rename(target)
@@ -136,6 +146,22 @@ def validate_guide(guide: Guide, frames: list[Frame]) -> Guide:
     return Guide(title=title, steps=[GuideStep(text=step.text.strip(), frameId=step.frameId, uncertainty=step.uncertainty) for step in guide.steps])
 
 
+def deduplicate_guide_steps(guide: Guide) -> Guide:
+    """Keep one final instruction per evidence image without losing visible actions."""
+    merged: dict[str, GuideStep] = {}
+    order: list[str] = []
+    for step in guide.steps:
+        existing = merged.get(step.frameId)
+        if existing is None:
+            merged[step.frameId] = step
+            order.append(step.frameId)
+            continue
+        sentences = list(dict.fromkeys((existing.text.strip(), step.text.strip())))
+        uncertainty = existing.uncertainty or step.uncertainty
+        merged[step.frameId] = GuideStep(text=" ".join(sentences), frameId=step.frameId, uncertainty=uncertainty)
+    return Guide(title=guide.title, steps=[merged[frame_id] for frame_id in order])
+
+
 class JobProcessor:
     def __init__(
         self,
@@ -146,6 +172,7 @@ class JobProcessor:
         analyzer: VisionAnalyzer | None = None,
     ):
         self.repository = repository
+        self.settings = settings
         self.extractor = extractor or FFmpegExtractor(settings)
         self.generator = generator or OpenAIResponsesGenerator(settings)
         self.analyzer = analyzer
@@ -160,6 +187,25 @@ class JobProcessor:
             if input_path is None:
                 raise AppError(422, "VIDEO_MISSING", "The uploaded video is missing.")
             extracted = self.extractor.extract(input_path, self.repository._job_dir(job_id) / "frames", job_id)
+            extracted = ExtractedFrames(
+                frames=[
+                    frame.model_copy(
+                        update={
+                            "sourceIndex": frame.sourceIndex if frame.sourceIndex is not None else index,
+                            "assemblyTimeSeconds": (
+                                frame.assemblyTimeSeconds
+                                if frame.assemblyTimeSeconds is not None
+                                else (len(extracted.frames) - 1 - index) / self.settings.analysis_fps
+                            ),
+                        }
+                    )
+                    for index, frame in enumerate(extracted.frames)
+                ],
+                paths=extracted.paths,
+            )
+            if job.mode == "manual":
+                self.repository.update(job_id, status="pairing", frames=extracted.frames, error=None)
+                return
             if hasattr(self.analyzer, "analyze_annotated"):
                 self.repository.update(job_id, status="annotating", frames=extracted.frames, error=None)
                 return
@@ -197,8 +243,8 @@ class JobProcessor:
                             self._generate_guide(frames_for_generation, paths_for_generation, event_batch),
                             frames_for_generation,
                         )
-                        if len(generated.steps) != len(event_batch):
-                            raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model did not return one step for each detected event.")
+                        if len(generated.steps) > len(event_batch):
+                            raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model returned more steps than supported event evidence.")
                         generated_guides.append(generated)
                     guide = Guide(
                         title=generated_guides[0].title,
@@ -209,7 +255,7 @@ class JobProcessor:
                     self._generate_guide(extracted.frames, extracted.paths, None),
                     extracted.frames,
                 )
-            self.repository.update(job_id, status="ready", guide=guide, error=None)
+            self.repository.update(job_id, status="ready", guide=deduplicate_guide_steps(guide), error=None)
         except AppError as exc:
             self.repository.update(job_id, status="failed", error=JobError(code=exc.code, message=exc.message))
         except Exception:
@@ -275,11 +321,11 @@ class JobProcessor:
                     self._generate_guide([frame for frame, _ in selected], [path for _, path in selected], event_batch),
                     [frame for frame, _ in selected],
                 )
-                if len(generated.steps) != len(event_batch):
-                    raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model did not return one step for each detected event.")
+                if len(generated.steps) > len(event_batch):
+                    raise AppError(502, "MODEL_INVALID_OUTPUT", "The guide model returned more steps than supported event evidence.")
                 generated_guides.append(generated)
             guide = Guide(title=generated_guides[0].title, steps=[step for generated in generated_guides for step in generated.steps])
-        self.repository.update(job_id, status="ready", guide=guide, error=None)
+        self.repository.update(job_id, status="ready", guide=deduplicate_guide_steps(guide), error=None)
 
     def _generate_guide(self, frames: list[Frame], paths: list[Path], events: list[AnalysisEvent] | None) -> Guide:
         if events is not None:

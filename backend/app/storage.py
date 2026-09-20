@@ -6,10 +6,11 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobResponse, JobStatus, PartAnnotation, PartTrack, TrackSummary
+from .models import AnalysisEvent, AnalysisInfo, Frame, Guide, JobError, JobMode, JobResponse, JobStatus, ManualPair, PartAnnotation, PartTrack, TrackSummary
 
 
 ACTIVE_STATUSES = {"queued", "extracting", "analyzing", "generating"}
+ADMISSION_STATUSES = ACTIVE_STATUSES | {"annotating", "pairing"}
 
 
 class JobRepository:
@@ -24,11 +25,11 @@ class JobRepository:
     def _job_dir(self, job_id: str) -> Path:
         return self.root / "jobs" / job_id
 
-    def create(self, job_id: str, filename: str) -> JobResponse:
+    def create(self, job_id: str, filename: str, mode: JobMode = "automated") -> JobResponse:
         directory = self._job_dir(job_id)
         (directory / "frames").mkdir(parents=True, exist_ok=False)
         (directory / "input").mkdir()
-        response = JobResponse(jobId=job_id, status="queued")
+        response = JobResponse(jobId=job_id, mode=mode, status="queued")
         self._write_json(directory / "metadata.json", {**response.model_dump(), "filename": filename})
         return response
 
@@ -62,28 +63,40 @@ class JobRepository:
         guide: Guide | None = None,
         error: JobError | None = None,
     ) -> JobResponse:
-        current = self.get(job_id)
-        if current is None:
-            raise KeyError(job_id)
-        updated = current.model_copy(
-            update={
-                "status": status if status is not None else current.status,
-                "frames": frames if frames is not None else current.frames,
-                "tracks": tracks if tracks is not None else current.tracks,
-                "annotations": annotations if annotations is not None else current.annotations,
-                "partTracks": part_tracks if part_tracks is not None else current.partTracks,
-                "trackingProgress": tracking_progress if tracking_progress is not None else current.trackingProgress,
-                "events": events if events is not None else current.events,
-                "analysis": analysis if analysis is not None else current.analysis,
-                "guide": guide if guide is not None else current.guide,
-                "error": error,
-            }
-        )
-        directory = self._job_dir(job_id)
-        self._write_json(directory / "metadata.json", updated.model_dump())
-        if guide is not None:
-            self._write_json(directory / "guide.json", guide.model_dump())
-        return updated
+        with self._lock:
+            current = self.get(job_id)
+            if current is None:
+                raise KeyError(job_id)
+            updated = current.model_copy(
+                update={
+                    "status": status if status is not None else current.status,
+                    "frames": frames if frames is not None else current.frames,
+                    "tracks": tracks if tracks is not None else current.tracks,
+                    "annotations": annotations if annotations is not None else current.annotations,
+                    "partTracks": part_tracks if part_tracks is not None else current.partTracks,
+                    "trackingProgress": tracking_progress if tracking_progress is not None else current.trackingProgress,
+                    "events": events if events is not None else current.events,
+                    "analysis": analysis if analysis is not None else current.analysis,
+                    "guide": guide if guide is not None else current.guide,
+                    "error": error,
+                }
+            )
+            directory = self._job_dir(job_id)
+            self._write_json(directory / "metadata.json", updated.model_dump())
+            if guide is not None:
+                self._write_json(directory / "guide.json", guide.model_dump())
+            return updated
+
+    def save_manual_pairs(self, job_id: str, *, revision: int, pairs: list[ManualPair]) -> JobResponse:
+        with self._lock:
+            current = self.get(job_id)
+            if current is None:
+                raise KeyError(job_id)
+            if current.revision != revision:
+                raise ValueError("PAIR_REVISION_CONFLICT")
+            updated = current.model_copy(update={"manualPairs": pairs, "revision": current.revision + 1, "error": None})
+            self._write_json(self._job_dir(job_id) / "metadata.json", updated.model_dump())
+            return updated
 
     def save_guide(self, job_id: str, guide: Guide) -> JobResponse:
         return self.update(job_id, guide=guide, error=None)
@@ -91,6 +104,21 @@ class JobRepository:
     def existing_frame_ids(self, job_id: str) -> set[str]:
         current = self.get(job_id)
         return {frame.frameId for frame in current.frames} if current else set()
+
+    def has_admitted_job(self) -> bool:
+        """Return whether persisted interactive or active work occupies the single-job slot."""
+        jobs_dir = self.root / "jobs"
+        if not jobs_dir.is_dir():
+            return False
+        with self._lock:
+            for metadata in jobs_dir.glob("*/metadata.json"):
+                try:
+                    raw = json.loads(metadata.read_text(encoding="utf-8"))
+                    if JobResponse.model_validate(raw).status in ADMISSION_STATUSES:
+                        return True
+                except (OSError, ValueError, TypeError):
+                    continue
+        return False
 
     def _write_json(self, path: Path, value: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

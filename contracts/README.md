@@ -6,8 +6,12 @@ multipart field named `video` and returns `202 {"jobId":"..."}`. Clients poll
 and supplied frame URLs. A complete guide can be saved with
 `PUT /jobs/{jobId}/guide`.
 
-`status` is one of `queued`, `extracting`, `analyzing`, `generating`, `ready`,
-or `failed`. During analysis, `tracks` and `events` are populated when local
+`status` is one of `queued`, `extracting`, `annotating`, `pairing`, `analyzing`,
+`generating`, `ready`, or `failed`. New jobs may select `mode: manual`; after
+extraction they pause at `pairing` with server-owned `sourceIndex` and
+`assemblyTimeSeconds` metadata on each frame. Manual pair saves use a monotonic
+`revision`, stable pair IDs, and semantic before/after frame IDs. Historic jobs
+without these fields default to the automated workflow. During automated analysis, `tracks` and `events` are populated when local
 SAM3 finds stable attachment or detachment evidence. Each event references a
 stable before/after frame pair and may carry an uncertainty reason. Frame IDs
 are stable for the lifetime of a job. A guide step must reference an existing

@@ -5,7 +5,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-JobStatus = Literal["queued", "extracting", "annotating", "analyzing", "generating", "ready", "failed"]
+JobMode = Literal["automated", "manual"]
+JobStatus = Literal["queued", "extracting", "annotating", "pairing", "analyzing", "generating", "ready", "failed"]
 EventKind = Literal["attach", "detach", "uncertain_change"]
 TrackVisibility = Literal["visible", "occluded", "lost"]
 TrackMembership = Literal["separate", "attached", "unknown"]
@@ -13,8 +14,22 @@ TrackMembership = Literal["separate", "attached", "unknown"]
 
 class Frame(BaseModel):
     frameId: str = Field(min_length=1)
+    sourceIndex: int | None = Field(default=None, ge=0)
     timestampSeconds: float = Field(ge=0)
+    assemblyTimeSeconds: float | None = Field(default=None, ge=0)
     imageUrl: str = Field(min_length=1)
+
+
+class ManualPair(BaseModel):
+    pairId: str = Field(min_length=1)
+    sequence: int = Field(ge=1)
+    beforeFrameId: str = Field(min_length=1)
+    afterFrameId: str = Field(min_length=1)
+
+
+class ManualPairsRequest(BaseModel):
+    revision: int = Field(ge=0)
+    pairs: list[ManualPair] = Field(min_length=1)
 
 
 class TrackSummary(BaseModel):
@@ -100,8 +115,11 @@ class JobError(BaseModel):
 
 class JobResponse(BaseModel):
     jobId: str = Field(min_length=1)
+    mode: JobMode = "automated"
     status: JobStatus
     frames: list[Frame] = Field(default_factory=list)
+    revision: int = Field(default=0, ge=0)
+    manualPairs: list[ManualPair] = Field(default_factory=list)
     tracks: list[TrackSummary] = Field(default_factory=list)
     annotations: list[PartAnnotation] = Field(default_factory=list)
     partTracks: list[PartTrack] = Field(default_factory=list)

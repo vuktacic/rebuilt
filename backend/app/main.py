@@ -6,16 +6,16 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .config import Settings, VisionRuntimeError
 from .errors import AppError, error_payload
-from .models import AnnotationRequest, Guide, JobCreated, JobResponse
+from .models import AnnotationRequest, Guide, JobCreated, JobMode, JobResponse, ManualPairsRequest
 from .processing import JobProcessor, validate_guide
-from .storage import ACTIVE_STATUSES, JobRepository
+from .storage import ADMISSION_STATUSES, JobRepository
 from .vision import NoopVisionAnalyzer, create_vision_analyzer, validate_vision_runtime
 
 
@@ -39,7 +39,8 @@ class JobCoordinator:
                 self.processor.process(job_id)
             finally:
                 with self._lock:
-                    if self._active_job_id == job_id:
+                    current = self.repository.get(job_id)
+                    if self._active_job_id == job_id and (current is None or current.status not in ADMISSION_STATUSES):
                         self._active_job_id = None
 
         threading.Thread(target=run, name=f"rebuilt-job-{job_id}", daemon=True).start()
@@ -62,9 +63,9 @@ class JobCoordinator:
     def busy(self) -> bool:
         with self._lock:
             if self._active_job_id is None:
-                return False
+                return self.repository.has_admitted_job()
             current = self.repository.get(self._active_job_id)
-            return current is not None and current.status in ACTIVE_STATUSES
+            return (current is not None and current.status in ADMISSION_STATUSES) or self.repository.has_admitted_job()
 
 
 def create_app(settings: Settings | None = None, *, processor: JobProcessor | None = None) -> FastAPI:
@@ -107,7 +108,10 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
         return {"status": "ok", "vision": "ready"}
 
     @app.post("/jobs", response_model=JobCreated, status_code=202)
-    async def create_job(video: Annotated[UploadFile, File(description="A phone recording of the build")]) -> JobCreated:
+    async def create_job(
+        video: Annotated[UploadFile, File(description="A phone recording of the build")],
+        mode: Annotated[JobMode, Form()] = "automated",
+    ) -> JobCreated:
         if vision_error is not None:
             raise vision_error
         if coordinator.busy():
@@ -118,7 +122,7 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
         if not content_type.startswith("video/") and suffix not in VIDEO_EXTENSIONS:
             raise AppError(422, "VIDEO_INVALID", "Upload a supported video file.")
         job_id = str(uuid.uuid4())
-        repository.create(job_id, filename)
+        repository.create(job_id, filename, mode)
         destination = repository.input_path(job_id, filename)
         total = 0
         try:
@@ -169,6 +173,35 @@ def create_app(settings: Settings | None = None, *, processor: JobProcessor | No
         if any(not annotation.points and annotation.box is None for annotation in request.annotations):
             raise AppError(422, "ANNOTATION_INVALID", "Each part needs a point or bounding box prompt.")
         return repository.update(job_id, annotations=request.annotations, error=None)
+
+    @app.put("/jobs/{job_id}/manual-pairs", response_model=JobResponse)
+    async def save_manual_pairs(job_id: str, request: ManualPairsRequest) -> JobResponse:
+        if not SAFE_ID.fullmatch(job_id):
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        job = repository.get(job_id)
+        if job is None:
+            raise AppError(404, "JOB_NOT_FOUND", "The requested job does not exist.")
+        if job.mode != "manual" or job.status != "pairing":
+            raise AppError(409, "PAIRS_NOT_READY", "Manual pairs can only be edited while a manual job is waiting for pairing.")
+        pair_ids = [pair.pairId for pair in request.pairs]
+        if len(pair_ids) != len(set(pair_ids)):
+            raise AppError(422, "PAIR_INVALID", "Each manual pair needs a unique pair ID.")
+        if [pair.sequence for pair in request.pairs] != list(range(1, len(request.pairs) + 1)):
+            raise AppError(422, "PAIR_INVALID", "Manual pair sequences must be consecutive and start at one.")
+        frames = {frame.frameId: frame for frame in job.frames}
+        for pair in request.pairs:
+            before = frames.get(pair.beforeFrameId)
+            after = frames.get(pair.afterFrameId)
+            if before is None or after is None:
+                raise AppError(422, "PAIR_FRAME_INVALID", "A manual pair refers to a frame that was not extracted.")
+            if before.frameId == after.frameId:
+                raise AppError(422, "PAIR_INVALID", "A manual pair needs distinct before and after frames.")
+            if before.assemblyTimeSeconds is None or after.assemblyTimeSeconds is None or before.assemblyTimeSeconds >= after.assemblyTimeSeconds:
+                raise AppError(422, "PAIR_CHRONOLOGY_INVALID", "Manual pair frames must advance in assembly chronology.")
+        try:
+            return repository.save_manual_pairs(job_id, revision=request.revision, pairs=request.pairs)
+        except ValueError as exc:
+            raise AppError(409, "PAIR_REVISION_CONFLICT", "The saved manual pairs changed. Refresh before saving again.") from exc
 
     @app.post("/jobs/{job_id}/track", response_model=JobResponse, status_code=202)
     async def track_backward(job_id: str) -> JobResponse:
