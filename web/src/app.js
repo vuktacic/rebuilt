@@ -145,12 +145,14 @@ function renderTrackingPreview() {
   elements.trackingPreviewPanel.hidden = !active;
   if (!active || !state.frames.length) return;
   elements.trackingFrame.max = String(state.frames.length - 1);
-  const frame = selectedFrame(state.frames, elements.trackingFrame);
+  const assemblyIndex = Number(elements.trackingFrame.value);
+  const sourceIndex = state.frames.length - 1 - assemblyIndex;
+  const frame = state.frames[sourceIndex];
   elements.trackingImage.src = frame.imageUrl;
-  elements.trackingFrameLabel.textContent = `${frame.frameId} · ${formatTime(frame.timestampSeconds)}`;
+  elements.trackingFrameLabel.textContent = `Assembly frame ${assemblyIndex + 1} · source ${frame.frameId} · ${formatTime(state.frames.at(-1).timestampSeconds - frame.timestampSeconds)}`;
   elements.trackingMarkers.replaceChildren();
   state.partTracks.forEach((track) => {
-    const observation = track.observations.find((item) => item.frameIndex === Number(elements.trackingFrame.value));
+    const observation = track.observations.find((item) => item.frameIndex === sourceIndex);
     if (!observation?.visible || !observation.bbox || !elements.trackingImage.naturalWidth) return;
     const [x, y, width, height] = observation.bbox;
     const box = document.createElement("div");
@@ -164,7 +166,7 @@ function renderTrackingPreview() {
   });
   elements.trackingLegend.replaceChildren(...state.partTracks.map((track) => {
     const line = document.createElement("p");
-    line.textContent = track.attachmentStartFrame === null ? `${track.name} · no confident attachment range` : `${track.name} · joins around frames ${track.attachmentStartFrame + 1}–${track.attachmentEndFrame + 1}`;
+    line.textContent = track.attachmentStartFrame === null ? `${track.name} · no confident attachment range` : `${track.name} · joins near assembly frames ${state.frames.length - track.attachmentStartFrame}–${state.frames.length - track.attachmentEndFrame}`;
     return line;
   }));
 }
@@ -209,7 +211,7 @@ function eventFrame(label, frameId) {
   const figure = document.createElement("figure");
   figure.className = "event-frame";
   const caption = document.createElement("figcaption");
-  caption.textContent = frame ? `${label} · ${formatTime(frame.timestampSeconds)}` : label;
+  caption.textContent = frame ? `${label} · build time ${formatTime(state.frames.at(-1).timestampSeconds - frame.timestampSeconds)}` : label;
   if (frame) {
     const image = document.createElement("img");
     image.src = frame.imageUrl;
@@ -241,7 +243,7 @@ function renderSteps() {
       media.append(image);
       const timestamp = document.createElement("span");
       timestamp.className = "timestamp";
-      timestamp.textContent = formatTime(frame.timestampSeconds);
+      timestamp.textContent = `Build time ${formatTime(state.frames.at(-1).timestampSeconds - frame.timestampSeconds)}`;
       media.append(timestamp);
     } else {
       media.textContent = "Choose an extracted frame";
