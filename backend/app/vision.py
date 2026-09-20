@@ -255,14 +255,16 @@ class Sam2BackwardVisionAnalyzer:
                 if candidate_bbox is not None:
                     candidates.append(overlap(observation.bbox, candidate_bbox))
             scores.append(max(candidates, default=0.0))
-        # Broad threshold: retain transitions where the part substantially joins
-        # another mask, then require a stable isolated state after disassembly.
-        for attached in range(0, max(0, len(scores) - 4)):
-            if min(scores[attached:attached + 3]) < 0.30:
+        # Work in source/disassembly order: attached → separate. Two high-score
+        # frames followed by two low-score frames is enough to retain a broad
+        # candidate for the manual. SAM2 can merge nearby parts into one mask
+        # after attachment, so demanding a long clean separation is too strict.
+        for attached in range(0, max(0, len(scores) - 3)):
+            if min(scores[attached:attached + 2]) < 0.30:
                 continue
-            if max(scores[attached + 3:attached + 5]) > 0.12:
+            if max(scores[attached + 2:attached + 4]) > 0.25:
                 continue
-            return attached + 3, attached + 2
+            return attached + 2, attached + 1
         return None, None
 
     def _events_from_part_tracks(self, tracks: list[PartTrack]) -> list[AnalysisEvent]:
